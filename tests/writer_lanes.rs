@@ -294,11 +294,11 @@ async fn drain(read: &mut PeerRead) -> Vec<Frame> {
 #[tokio::test]
 async fn audio_queued_before_stream_end_is_written_before_it() {
     let (group, conn, mut read) = one_member_group().await;
-    group.start_stream(pcm_config()).await.unwrap();
+    group.start_stream(pcm_config()).await;
     for i in 0..5u8 {
         group.push_audio(&[i; 8]);
     }
-    group.end_stream().await.unwrap();
+    group.end_stream().await;
     conn.disconnect().await.unwrap();
 
     assert_eq!(
@@ -323,7 +323,7 @@ async fn audio_queued_before_stream_end_is_written_before_it() {
 #[tokio::test]
 async fn audio_from_a_superseded_stream_is_dropped_at_the_next_stream_start() {
     let (group, conn, mut read) = one_member_group().await;
-    group.start_stream(pcm_config()).await.unwrap();
+    group.start_stream(pcm_config()).await;
     // Queued against the 48kHz stream, then superseded before the writer runs.
     for _ in 0..5 {
         group.push_audio(&[0xAA; 8]);
@@ -332,7 +332,7 @@ async fn audio_from_a_superseded_stream_is_dropped_at_the_next_stream_start() {
         sample_rate: 44100,
         ..pcm_config()
     };
-    group.start_stream(restarted).await.unwrap();
+    group.start_stream(restarted).await;
     group.push_audio(&[0xBB; 8]);
     // `disconnect` discards whatever audio is still queued, so park the read half
     // on an *awaited* chunk: the audio lane is FIFO, so once this one is on the
@@ -361,7 +361,7 @@ async fn audio_from_a_superseded_stream_is_dropped_at_the_next_stream_start() {
 #[tokio::test]
 async fn audio_queued_before_stream_clear_is_dropped() {
     let (group, conn, mut read) = one_member_group().await;
-    group.start_stream(pcm_config()).await.unwrap();
+    group.start_stream(pcm_config()).await;
     for _ in 0..5 {
         group.push_audio(&[0xAA; 8]);
     }
@@ -417,9 +417,9 @@ async fn lifecycle_frames_stay_paired_while_another_thread_pushes() {
     });
 
     for _ in 0..5 {
-        group.start_stream(pcm_config()).await.unwrap();
+        group.start_stream(pcm_config()).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
-        group.end_stream().await.unwrap();
+        group.end_stream().await;
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     stop.store(true, Ordering::Relaxed);

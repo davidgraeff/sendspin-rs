@@ -48,6 +48,19 @@ struct TimelineState {
 }
 
 impl SharedTimeline {
+    /// The timeline state, recovering from a poisoned lock rather than propagating
+    /// the panic — see the equivalent on `Group`. The state is an `Option<config>`
+    /// plus two integers, and the only damage a half-finished mutation can do is a
+    /// stale anchor, which the re-anchor branch in [`Self::stamp`] heals on the next
+    /// chunk. Killing the audio path to protect that would be a bad trade.
+    fn state(&self) -> std::sync::MutexGuard<'_, TimelineState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl SharedTimeline {
     /// Create a timeline in `clock`'s domain. Pass the same clock the
     /// [`crate::server::ServerListener`] that accepted these connections was
     /// built with, so timestamps here match the `server/time` replies members
@@ -87,7 +100,7 @@ impl SharedTimeline {
     /// Set the streaming format and re-anchor the timeline. Call when a stream
     /// starts (or its format changes).
     pub fn set_config(&self, config: StreamPlayerConfig) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.config = Some(config);
         state.next_ts_us = None;
         state.residue = 0;
@@ -96,12 +109,12 @@ impl SharedTimeline {
     /// The format currently streaming, if any — used to (re)issue `stream/start`
     /// to a late-joining member.
     pub fn config(&self) -> Option<StreamPlayerConfig> {
-        self.state.lock().unwrap().config.clone()
+        self.state().config.clone()
     }
 
     /// Clear the streaming format and reset the timeline (stream ended).
     pub fn clear_config(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.config = None;
         state.next_ts_us = None;
         state.residue = 0;
@@ -109,7 +122,7 @@ impl SharedTimeline {
 
     /// Reset the anchor without touching the format (e.g. after a clear/seek).
     pub fn reset(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.next_ts_us = None;
         state.residue = 0;
     }
@@ -127,8 +140,12 @@ impl SharedTimeline {
     /// mark, giving hysteresis so steady real-time pacing doesn't re-anchor
     /// every chunk.
     pub fn stamp(&self, pcm_len: usize) -> i64 {
-        let mut state = self.state.lock().unwrap();
+        // Read the clock before taking the lock. `now` only feeds the re-anchor
+        // comparison below, so a slightly staler reading can only make that
+        // decision more conservative — and on some targets this is a syscall, which
+        // has no business inside a lock a real-time producer contends for.
         let now = self.clock.now_micros();
+        let mut state = self.state();
 
         let ts = match state.next_ts_us {
             Some(t) if t >= now + self.send_ahead_us / 2 => t,

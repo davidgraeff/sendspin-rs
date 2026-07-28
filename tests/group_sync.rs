@@ -88,8 +88,7 @@ async fn two_members_receive_identical_timestamped_audio() {
             bit_depth: 16,
             codec_header: None,
         })
-        .await
-        .unwrap();
+        .await;
     let sent_timestamp = group.push_audio(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
     let mut read_a = peer_a.await.unwrap();
@@ -155,8 +154,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
             bit_depth: 16,
             codec_header: None,
         })
-        .await
-        .unwrap();
+        .await;
     // Sent before the late joiner exists — it must never see this.
     group.push_audio(&[0xAA; 8]);
 
@@ -379,12 +377,10 @@ async fn separate_groups_sharing_a_timeline_stamp_identically() {
         codec_header: None,
     };
     // The shared-timeline contract: the *coordinator* owns the timeline's
-    // config/anchor, and each group only announces the stream to its own
-    // members. `start_stream` would re-anchor the shared timeline from inside
-    // one group and desync the other, so it's refused here (see
-    // `lifecycle_calls_that_mutate_a_shared_timeline_are_refused`).
+    // config/anchor, and each group only announces the stream to its own members.
+    // `start_stream` would re-anchor the shared timeline from inside one group and
+    // desync the other, so a `Group<SharesTimeline>` does not have it at all.
     timeline.set_config(config.clone());
-    assert!(group_a.start_stream(config.clone()).await.is_err());
     group_a.broadcast_stream_start(config.clone()).await;
     group_b.broadcast_stream_start(config).await;
 
