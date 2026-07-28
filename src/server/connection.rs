@@ -475,8 +475,9 @@ impl ServerConnection {
             write_timeout,
         ));
 
+        let router_id = hello.client_id.clone();
         let router_handle = tokio::spawn(async move {
-            Self::message_router(read, message_tx, time_tx, clock).await;
+            Self::message_router(read, message_tx, time_tx, clock, router_id).await;
         });
 
         let sender = ServerSender {
@@ -579,11 +580,16 @@ impl ServerConnection {
         message_tx: UnboundedSender<Message>,
         time_tx: watch::Sender<Option<TimeRequest>>,
         clock: Arc<dyn Clock>,
+        client_id: String,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut message_closed = false;
         let mut last_time_reply_us: Option<i64> = None;
+        // For the sync-progress log below: how many `client/time` exchanges this
+        // connection has served, and since when.
+        let mut time_exchanges: u64 = 0;
+        let connected_at_us = clock.now_micros();
 
         while let Some(msg) = read.next().await {
             match msg {
@@ -603,6 +609,22 @@ impl ServerConnection {
                             if too_soon {
                                 log::trace!("Ignoring client/time inside the reply interval");
                                 continue;
+                            }
+                            // Count them, and say so periodically. A player must
+                            // establish clock sync before it can schedule anything, so
+                            // "how far along is this client's sync?" is the difference
+                            // between "the server isn't sending" and "the client isn't
+                            // ready yet" — a distinction that is otherwise invisible
+                            // from the server side, and the one an embedder debugging
+                            // silence-after-connect actually needs. Logged on the
+                            // exchanges where the answer changes shape (the first, then
+                            // sparsely), not every second.
+                            time_exchanges += 1;
+                            if time_exchanges == 1 || time_exchanges.is_multiple_of(10) {
+                                log::info!(
+                                    "[{client_id}] {time_exchanges} time exchange(s), {:.1}s since connect",
+                                    (server_received - connected_at_us) as f64 / 1e6
+                                );
                             }
                             last_time_reply_us = Some(server_received);
                             if time_tx

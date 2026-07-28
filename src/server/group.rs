@@ -83,6 +83,24 @@ pub struct Group<Timeline = OwnsTimeline> {
     _timeline: PhantomData<Timeline>,
 }
 
+/// What one [`Group::push_at`] did to the group's member queues.
+///
+/// `dropped` is the field a silence report needs: a member whose backlog has reached
+/// `MAX_QUEUED_AUDIO_FRAMES` is not draining its socket, so its audio is discarded
+/// rather than allowed to back the process up — and that is a *per-member* condition
+/// invisible in any whole-group metric. The group's chunk rate and timestamp
+/// continuity stay perfect while one player receives nothing at all, which is exactly
+/// the case where an embedder would otherwise be reduced to guessing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PushOutcome {
+    /// Members the frame was queued for.
+    pub queued: u32,
+    /// Members whose backlog was full, so this frame was discarded for them.
+    pub dropped: u32,
+    /// Members found disconnected and pruned by this push.
+    pub disconnected: u32,
+}
+
 impl<Timeline> Group<Timeline> {
     /// The member map, recovering from a poisoned lock rather than propagating the
     /// panic.
@@ -315,7 +333,11 @@ impl<Timeline> Group<Timeline> {
     /// `ts` to each group/sender, so every member's chunk-N carries an
     /// identical timestamp. (For a group that owns its timeline, prefer
     /// [`Group::push_audio`], which stamps and fans in one call.)
-    pub fn push_at(&self, ts: i64, pcm: &[u8]) {
+    /// Returns how the chunk landed, per member — see [`PushOutcome`]. A caller
+    /// that ignores it loses nothing; a caller that reports it can tell "the server
+    /// stopped sending" apart from "the player stopped playing", which from the
+    /// server side are otherwise indistinguishable.
+    pub fn push_at(&self, ts: i64, pcm: &[u8]) -> PushOutcome {
         // Encode *before* taking the lock. The frame is a pure function of
         // (ts, pcm) and observable to nobody, so this does not weaken the ordering
         // guarantee — the enqueue still happens under the lock, synchronously —
@@ -323,18 +345,20 @@ impl<Timeline> Group<Timeline> {
         // section that a SCHED_FIFO producer may be waiting on.
         let frame = encode_audio_frame(ts, pcm);
         let mut members = self.members();
-        Self::fan_out_frame(&mut members, frame);
+        Self::fan_out_frame(&mut members, frame)
     }
 
     /// Encode, then fan out. Only used where the timestamp is produced under the
     /// same lock ([`Self::push_audio`]); [`Self::push_at`] encodes outside it.
     fn fan_out(members: &mut HashMap<String, ServerSender>, ts: i64, pcm: &[u8]) {
-        Self::fan_out_frame(members, encode_audio_frame(ts, pcm));
+        let _ = Self::fan_out_frame(members, encode_audio_frame(ts, pcm));
     }
+
 
     /// Fan one already-encoded frame out to every member as cheap refcount clones,
     /// and prune members whose connection has died.
-    fn fan_out_frame(members: &mut HashMap<String, ServerSender>, frame: AudioFrame) {
+    fn fan_out_frame(members: &mut HashMap<String, ServerSender>, frame: AudioFrame) -> PushOutcome {
+        let mut outcome = PushOutcome::default();
         let mut dead = Vec::new();
         // Hand the buffer to the *last* member rather than cloning for it. With a
         // single member — the per-device topology this exists to serve — that means
@@ -349,17 +373,20 @@ impl<Timeline> Group<Timeline> {
                 frame.clone().expect("frame is owned until the last member")
             };
             match sender.queue_audio(this) {
-                AudioEnqueue::Queued => {}
+                AudioEnqueue::Queued => outcome.queued += 1,
                 AudioEnqueue::Dropped => {
+                    outcome.dropped += 1;
                     log::trace!("group member {id} audio backlog full, dropping chunk")
                 }
                 AudioEnqueue::Disconnected => dead.push(id.clone()),
             }
         }
+        outcome.disconnected = dead.len() as u32;
         for id in dead {
             log::warn!("dropping dead group member {id}");
             members.remove(&id);
         }
+        outcome
     }
 
     /// Broadcast a player command (volume, mute, static delay) to every
