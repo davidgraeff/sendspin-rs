@@ -1,12 +1,16 @@
-// ABOUTME: Integration tests for the per-connection writer's two lanes: control
-// ABOUTME: frames never wait behind queued audio, and a socket that has stopped
-// ABOUTME: draining fails its writes instead of parking control and close forever.
+// ABOUTME: Integration tests for the per-connection writer's two lanes:
+// ABOUTME: control frames never wait behind queued audio, a stalled socket can't
+// ABOUTME: park control or close forever, and lifecycle/audio order stays valid.
 
 use futures_util::{SinkExt, StreamExt};
 use sendspin::protocol::client::AudioChunk;
-use sendspin::protocol::messages::{ClientHello, Message, PlayerCommand, PlayerCommandType};
-use sendspin::server::{AudioEnqueue, ServerSender};
+use sendspin::protocol::messages::{
+    ClientHello, Message, PlayerCommand, PlayerCommandType, StreamPlayerConfig,
+};
+use sendspin::server::{AudioEnqueue, Group, ServerSender};
 use sendspin::ServerListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -38,6 +42,16 @@ async fn connect_peer(url: &str, client_id: &str) -> PeerRead {
     write.send(WsMessage::Text(hello.into())).await.unwrap();
     read.next().await.expect("no server/hello").unwrap(); // discard server/hello
     read
+}
+
+fn pcm_config() -> StreamPlayerConfig {
+    StreamPlayerConfig {
+        codec: "pcm".to_string(),
+        sample_rate: 48000,
+        channels: 2,
+        bit_depth: 16,
+        codec_header: None,
+    }
 }
 
 fn volume(v: u8) -> PlayerCommand {
@@ -206,5 +220,222 @@ async fn a_stalled_socket_fails_control_and_close_instead_of_hanging() {
             .await
             .is_ok(),
         "disconnect() hung on a stalled socket"
+    );
+}
+
+/// Set up a listener plus one connected, non-reading peer and a single-member
+/// group, returning the pieces the ordering tests need.
+async fn one_member_group() -> (Group, sendspin::ServerConnection, PeerRead) {
+    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let peer = tokio::spawn({
+        let url = format!("ws://{addr}");
+        async move { connect_peer(&url, "member").await }
+    });
+    let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let read = peer.await.unwrap();
+    let group = Group::new(Arc::new(sendspin::DefaultClock::default()));
+    group
+        .add_member(conn.client_id().to_string(), conn.sender())
+        .await
+        .unwrap();
+    (group, conn, read)
+}
+
+/// What a client actually observed, reduced to the part these tests care about:
+/// the order of lifecycle frames and audio payloads.
+#[derive(Debug, PartialEq, Eq)]
+enum Frame {
+    /// `stream/start`, carrying the sample rate so a format change is visible.
+    Start(u32),
+    End,
+    Clear,
+    /// One audio frame, identified by its (uniform) first payload byte.
+    Audio(u8),
+}
+
+/// Drain everything the peer has been sent, until the close frame.
+async fn drain(read: &mut PeerRead) -> Vec<Frame> {
+    let mut out = Vec::new();
+    while let Ok(Some(Ok(msg))) = timeout(Duration::from_secs(5), read.next()).await {
+        match msg {
+            WsMessage::Text(text) => match serde_json::from_str::<Message>(&text).unwrap() {
+                Message::StreamStart(s) => {
+                    out.push(Frame::Start(s.player.expect("player config").sample_rate))
+                }
+                Message::StreamEnd(_) => out.push(Frame::End),
+                Message::StreamClear(_) => out.push(Frame::Clear),
+                _ => {}
+            },
+            WsMessage::Binary(bytes) => {
+                let chunk = AudioChunk::from_bytes(&bytes).unwrap();
+                out.push(Frame::Audio(chunk.data[0]));
+            }
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `stream/end` means "after everything I sent", so it must **not** overtake the
+/// audio queued ahead of it — the naive fix for the starvation problem (give
+/// control frames blanket priority) silently truncates the tail of every stream.
+///
+/// The pushes and the `end_stream` queueing happen with no `await` between them,
+/// so on the single-threaded test runtime the writer cannot have drained anything
+/// in between: when it runs, all five frames and the `stream/end` are queued
+/// together and the order it produces is the thing under test.
+#[tokio::test]
+async fn audio_queued_before_stream_end_is_written_before_it() {
+    let (group, conn, mut read) = one_member_group().await;
+    group.start_stream(pcm_config()).await.unwrap();
+    for i in 0..5u8 {
+        group.push_audio(&[i; 8]);
+    }
+    group.end_stream().await.unwrap();
+    conn.disconnect().await.unwrap();
+
+    assert_eq!(
+        drain(&mut read).await,
+        vec![
+            Frame::Start(48000),
+            Frame::Audio(0),
+            Frame::Audio(1),
+            Frame::Audio(2),
+            Frame::Audio(3),
+            Frame::Audio(4),
+            Frame::End,
+        ],
+        "stream/end must follow the audio pushed before it, in push order"
+    );
+}
+
+/// A `stream/start` supersedes the stream before it, so audio still queued from
+/// that old stream must be dropped rather than delivered after the new
+/// `stream/start` — where the client would decode it against the *new* format.
+/// Audio pushed after the restart is untouched.
+#[tokio::test]
+async fn audio_from_a_superseded_stream_is_dropped_at_the_next_stream_start() {
+    let (group, conn, mut read) = one_member_group().await;
+    group.start_stream(pcm_config()).await.unwrap();
+    // Queued against the 48kHz stream, then superseded before the writer runs.
+    for _ in 0..5 {
+        group.push_audio(&[0xAA; 8]);
+    }
+    let restarted = StreamPlayerConfig {
+        sample_rate: 44100,
+        ..pcm_config()
+    };
+    group.start_stream(restarted).await.unwrap();
+    group.push_audio(&[0xBB; 8]);
+    // `disconnect` discards whatever audio is still queued, so park the read half
+    // on an *awaited* chunk: the audio lane is FIFO, so once this one is on the
+    // wire the 0xBB frame provably is too.
+    conn.sender()
+        .send_audio_chunk(9_999, &[0xCC; 8])
+        .await
+        .unwrap();
+    conn.disconnect().await.unwrap();
+
+    assert_eq!(
+        drain(&mut read).await,
+        vec![
+            Frame::Start(48000),
+            Frame::Start(44100),
+            Frame::Audio(0xBB),
+            Frame::Audio(0xCC),
+        ],
+        "audio from the superseded stream must not survive the restart"
+    );
+}
+
+/// `stream/clear` tells the client to discard buffered audio; writing the audio
+/// we're still holding for it would be pointless work at best and a race at
+/// worst, so it's dropped one hop earlier.
+#[tokio::test]
+async fn audio_queued_before_stream_clear_is_dropped() {
+    let (group, conn, mut read) = one_member_group().await;
+    group.start_stream(pcm_config()).await.unwrap();
+    for _ in 0..5 {
+        group.push_audio(&[0xAA; 8]);
+    }
+    group.clear_stream().await;
+    group.push_audio(&[0xBB; 8]);
+    // See the note in the superseded-stream test: awaited so the push above is
+    // provably on the wire before `disconnect` drops what's left.
+    conn.sender()
+        .send_audio_chunk(9_999, &[0xCC; 8])
+        .await
+        .unwrap();
+    conn.disconnect().await.unwrap();
+
+    assert_eq!(
+        drain(&mut read).await,
+        vec![
+            Frame::Start(48000),
+            Frame::Clear,
+            Frame::Audio(0xBB),
+            Frame::Audio(0xCC),
+        ],
+        "audio the client is being told to discard must not be written"
+    );
+}
+
+/// Lifecycle transitions and audio pushes contending from *different threads* —
+/// the shape a real capture pipeline has, with a dedicated audio thread pushing
+/// while the async side starts and ends streams.
+///
+/// The strong ordering guarantee here is structural: `Group` queues its
+/// lifecycle frames and its audio under one lock, so there is no window inside
+/// `start_stream`/`end_stream` for a push to interleave. That's not directly
+/// observable from outside (a push that races the *call* is the caller's own
+/// ordering, not the library's), so what this asserts is what contention could
+/// still break: lifecycle frames must not be lost, duplicated, or reordered
+/// relative to each other, and the connection must survive. Audio between
+/// windows is the pusher's own doing and ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_frames_stay_paired_while_another_thread_pushes() {
+    let (group, conn, mut read) = one_member_group().await;
+    let group = Arc::new(group);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let pusher = std::thread::spawn({
+        let group = Arc::clone(&group);
+        let stop = Arc::clone(&stop);
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                group.push_audio(&[0x11; 64]);
+                std::thread::yield_now();
+            }
+        }
+    });
+
+    for _ in 0..5 {
+        group.start_stream(pcm_config()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        group.end_stream().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    pusher.join().unwrap();
+    conn.disconnect().await.unwrap();
+
+    let lifecycle: Vec<Frame> = drain(&mut read)
+        .await
+        .into_iter()
+        .filter(|f| !matches!(f, Frame::Audio(_)))
+        .collect();
+    let expected: Vec<Frame> = (0..5)
+        .flat_map(|_| [Frame::Start(48000), Frame::End])
+        .collect();
+    assert_eq!(
+        lifecycle, expected,
+        "lifecycle frames must stay strictly paired under cross-thread contention"
     );
 }

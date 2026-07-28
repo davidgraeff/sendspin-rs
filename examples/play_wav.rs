@@ -241,6 +241,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("computed chunk size is zero — check --chunk-ms and the WAV format".into());
     }
 
+    // Infallible here: this group owns its timeline, so start_stream can't hit
+    // the shared-timeline refusal.
     group
         .start_stream(sendspin::protocol::messages::StreamPlayerConfig {
             codec: "pcm".to_string(),
@@ -249,7 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bit_depth: wav.bit_depth,
             codec_header: None,
         })
-        .await;
+        .await?;
 
     // push_audio enqueues without blocking and the Group anchors its own
     // timeline, so playback timing no longer depends on the exact push cadence
@@ -270,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("done sending audio, ending stream");
-    group.end_stream().await;
+    group.end_stream().await?;
 
     // Give the last chunks time to actually finish playing before hanging up.
     tokio::time::sleep(Duration::from_secs(2)).await;
