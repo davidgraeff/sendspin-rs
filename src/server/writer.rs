@@ -10,25 +10,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::watch;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio_tungstenite::{
     tungstenite::{Bytes, Message as WsMessage},
     WebSocketStream,
 };
+
+/// Maximum `server/time` replies a connection may have queued but not yet written.
+///
+/// Sized for a burst comfortably larger than the reference client's (8 requests
+/// back-to-back, each awaiting its reply) so ordinary sync traffic never touches the
+/// bound, while still capping what a flooding peer can make us hold. Hitting it is
+/// logged at WARN, because at that point either the peer is misbehaving or our writer
+/// is not keeping up — both worth knowing, and neither worth hiding.
+pub(super) const MAX_QUEUED_TIME_REPLIES: usize = 32;
 
 /// Maximum audio frames a single connection may have queued but not yet
 /// written before [`ServerSender::enqueue_audio`] starts dropping frames. This
 /// bounds memory for a slow or stalled member so it can't back up the whole
 /// process — its own audio suffers, nobody else's does.
 pub(super) const MAX_QUEUED_AUDIO_FRAMES: usize = 32;
-
-/// Minimum spacing between `server/time` replies. The spec's cadence is about
-/// one `client/time` per second; a peer that asks far faster gains nothing (each
-/// reply supersedes the last) and would otherwise convert its own send rate into
-/// server work. Requests arriving inside this window are answered by the reply
-/// already pending rather than queueing another.
-pub(super) const MIN_TIME_REPLY_INTERVAL_US: i64 = 50_000;
 
 /// Default deadline for a single WebSocket write before the connection is
 /// declared dead (override with [`crate::server::ServerRole::write_timeout`]).
@@ -95,12 +96,25 @@ pub(super) enum ControlCommand {
 
 /// A pending `server/time` echo.
 ///
-/// This travels in a single-slot [`watch`] channel rather than a queue, and that
-/// is a correctness property, not an optimisation: the reply is derived purely
-/// from the *latest* request, so a peer that floods `client/time` can only ever
-/// have one outstanding. Queueing one per request instead lets a peer's send rate
-/// dictate the server's memory use and, because control frames are written ahead
-/// of audio, starve the audio lane to a standstill.
+/// This travels in a **small bounded queue**, one entry per request. It used to be
+/// a single-slot [`watch`] channel, documented as "a correctness property, not an
+/// optimisation" on the grounds that a reply derived from the *latest* request makes
+/// an earlier one redundant. That reasoning is wrong, and expensively so: the client
+/// matches each `server/time` to its request by `client_transmitted` and derives the
+/// measurement's `max_error` from that specific round trip, so a superseded request
+/// is not answered redundantly — it is **not answered at all**. A player that is
+/// one-request-in-flight (the ESPHome client is, with a 10 s timeout and no
+/// retransmit) then stalls for its full timeout per lost reply, and decodes nothing
+/// until its opening burst completes. That was measured as 20-30 s of silence after
+/// every reconnect.
+///
+/// The starvation concern the old comment raised is real and is handled by bounding
+/// the queue instead of collapsing it: the writer takes **one** reply per loop pass,
+/// so the time lane still cannot hold more than one frame's worth of priority over
+/// audio no matter how fast a peer asks, and [`MAX_QUEUED_TIME_REPLIES`] caps the
+/// memory. A peer that overruns even that gets a **logged warning**, never a silent
+/// drop — a client cannot distinguish "dropped" from "network stalled", which is why
+/// silence is the most expensive answer available.
 ///
 /// `server_transmitted` is stamped by the writer immediately before the frame
 /// reaches the wire, not here — waiting time would otherwise leak into the
@@ -220,7 +234,7 @@ where
 pub(super) async fn writer_task<S>(
     mut sink: SplitSink<WebSocketStream<S>, WsMessage>,
     mut ctrl_rx: UnboundedReceiver<ControlCommand>,
-    mut time_rx: watch::Receiver<Option<TimeRequest>>,
+    mut time_rx: mpsc::Receiver<TimeRequest>,
     mut audio_rx: UnboundedReceiver<AudioCommand>,
     clock: Arc<dyn Clock>,
     audio_queued: Arc<AtomicUsize>,
@@ -236,9 +250,9 @@ pub(super) async fn writer_task<S>(
     loop {
         // `biased` makes this a strict priority rather than a random choice:
         // whenever a control frame is queued it is taken first, so queued audio
-        // can never delay one. The time lane sits between the two: it is
-        // single-slot, so it can hold at most one frame's worth of priority over
-        // audio no matter how fast a peer asks.
+        // can never delay one. The time lane sits between the two: exactly one reply
+        // is taken per pass, so however deep its queue is it can hold at most one
+        // frame's worth of priority over audio.
         tokio::select! {
             biased;
             Some(cmd) = ctrl_rx.recv() => {
@@ -294,13 +308,10 @@ pub(super) async fn writer_task<S>(
                     }
                 }
             }
-            Ok(()) = time_rx.changed() => {
+            Some(req) = time_rx.recv() => {
                 // Stamp `server_transmitted` here, immediately before the write, so
                 // however long this reply waited behind other frames does not leak
                 // into the client's clock filter as measurement error.
-                let Some(req) = *time_rx.borrow_and_update() else {
-                    continue;
-                };
                 let reply = Message::ServerTime(ServerTime {
                     client_transmitted: req.client_transmitted,
                     server_received: req.server_received,

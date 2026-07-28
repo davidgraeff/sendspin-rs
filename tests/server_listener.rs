@@ -141,6 +141,80 @@ async fn time_sync_echo_reflects_client_transmitted_and_orders_timestamps() {
 }
 
 #[tokio::test]
+async fn every_client_time_is_answered_even_back_to_back() {
+    // Regression guard. This server used to drop any `client/time` arriving within
+    // 50 ms of its previous reply, justified as "the spec's cadence is about one
+    // per second". The spec says the opposite — cadence is the client's choice, and
+    // the reference implementation it points at sends a burst of 8 back-to-back,
+    // each waiting for its reply.
+    //
+    // The cost on real hardware was severe and took a long investigation to find: an
+    // ESPHome player is one-request-in-flight with a 10 s response timeout and no
+    // retransmit, and it decodes *nothing* until its first burst completes. Every
+    // dropped request therefore bought 10 s of total silence, and a reconnect cost
+    // 20-30 s — varying per device with how its main loop happened to straddle the
+    // 50 ms window, which is what made it look like a per-device firmware bug.
+    //
+    // So: a burst of requests with no pacing whatsoever must produce exactly as many
+    // `server/time` replies, each echoing its own `client_transmitted`. If a future
+    // change adds backpressure here it must still *reply* to every request.
+    const BURST: usize = 8;
+
+    let listener = ServerRole::new("test-server", "Test Server")
+        .bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let url = format!("ws://{addr}");
+
+    let peer = tokio::spawn(async move {
+        let (ws, _) = connect_async(&url).await.expect("ws connect");
+        let (mut write, mut read) = ws.split();
+        let hello = serde_json::to_string(&Message::ClientHello(test_hello("peer-burst"))).unwrap();
+        write.send(WsMessage::Text(hello.into())).await.unwrap();
+        read.next().await.expect("no server/hello").unwrap(); // discard server/hello
+
+        // Send the whole burst first, with no delay between sends: this is the case
+        // the old rate limit silently discarded.
+        for i in 0..BURST {
+            let client_transmitted = 1_000_000i64 + i as i64;
+            let msg = serde_json::to_string(&Message::ClientTime(ClientTime { client_transmitted }))
+                .unwrap();
+            write.send(WsMessage::Text(msg.into())).await.unwrap();
+        }
+
+        let mut echoed = Vec::new();
+        for _ in 0..BURST {
+            let text = match read.next().await.expect("server closed early").unwrap() {
+                WsMessage::Text(t) => t,
+                other => panic!("expected text server/time, got {other:?}"),
+            };
+            match serde_json::from_str::<Message>(&text).expect("server/time must deserialize") {
+                Message::ServerTime(st) => echoed.push(st.client_transmitted),
+                other => panic!("expected server/time, got {other:?}"),
+            }
+        }
+        echoed
+    });
+
+    let (_conn, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let echoed = timeout(Duration::from_secs(10), peer)
+        .await
+        .expect("peer timed out waiting for replies — a request was dropped")
+        .expect("peer task panicked");
+
+    let expected: Vec<i64> = (0..BURST).map(|i| 1_000_000i64 + i as i64).collect();
+    assert_eq!(
+        echoed, expected,
+        "every client/time must get its own server/time back, in order"
+    );
+}
+
+#[tokio::test]
 async fn pushed_audio_and_stream_lifecycle_reach_the_client_intact() {
     let listener = ServerRole::new("test-server", "Test Server")
         .bind("127.0.0.1:0")

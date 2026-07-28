@@ -9,7 +9,7 @@ use crate::protocol::messages::{
 use crate::server::binary::{encode_audio_frame, AudioFrame};
 use crate::server::writer::{
     write_frame, writer_task, AudioCommand, AudioOrdering, ControlCommand, TimeRequest,
-    MAX_QUEUED_AUDIO_FRAMES, MIN_TIME_REPLY_INTERVAL_US,
+    MAX_QUEUED_AUDIO_FRAMES, MAX_QUEUED_TIME_REPLIES,
 };
 use crate::sync::raw_clock::Clock;
 use futures_util::{
@@ -20,8 +20,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::watch;
+use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{tungstenite::Message as WsMessage, WebSocketStream};
 
 /// The only role this server negotiates in v1. See the crate-level server
@@ -461,7 +460,7 @@ impl ServerConnection {
 
         let (ctrl_tx, ctrl_rx) = unbounded_channel::<ControlCommand>();
         let (audio_tx, audio_rx) = unbounded_channel::<AudioCommand>();
-        let (time_tx, time_rx) = watch::channel::<Option<TimeRequest>>(None);
+        let (time_tx, time_rx) = mpsc::channel::<TimeRequest>(MAX_QUEUED_TIME_REPLIES);
         let (message_tx, message_rx) = unbounded_channel();
 
         let audio_queued = Arc::new(AtomicUsize::new(0));
@@ -578,17 +577,23 @@ impl ServerConnection {
     async fn message_router<S>(
         mut read: SplitStream<WebSocketStream<S>>,
         message_tx: UnboundedSender<Message>,
-        time_tx: watch::Sender<Option<TimeRequest>>,
+        time_tx: mpsc::Sender<TimeRequest>,
         clock: Arc<dyn Clock>,
         client_id: String,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut message_closed = false;
-        let mut last_time_reply_us: Option<i64> = None;
-        // For the sync-progress log below: how many `client/time` exchanges this
-        // connection has served, and since when.
-        let mut time_exchanges: u64 = 0;
+        // For the sync-progress log below: how many `client/time` requests this
+        // connection has *received* and how many it has *answered*, and since when.
+        //
+        // The two are counted separately on purpose. An earlier version counted only
+        // the answered ones, which made a server-side drop indistinguishable from a
+        // client that simply wasn't asking — and that is exactly the confusion that
+        // sent a multi-day investigation looking for WiFi loss and firmware bugs. If
+        // these two numbers ever diverge, the server is the problem.
+        let mut time_received: u64 = 0;
+        let mut time_replied: u64 = 0;
         let connected_at_us = clock.now_micros();
 
         while let Some(msg) = read.next().await {
@@ -599,42 +604,82 @@ impl ServerConnection {
                     let server_received = clock.now_micros();
                     match serde_json::from_str::<Message>(&text) {
                         Ok(Message::ClientTime(t)) => {
-                            // Rate-limit, then coalesce. A peer asking faster than
-                            // the spec's ~1/s cadence gains nothing — each reply
-                            // supersedes the last — but answering every request
-                            // would let its send rate drive our work and memory.
-                            let too_soon = last_time_reply_us.is_some_and(|last| {
-                                server_received - last < MIN_TIME_REPLY_INTERVAL_US
-                            });
-                            if too_soon {
-                                log::trace!("Ignoring client/time inside the reply interval");
-                                continue;
-                            }
-                            // Count them, and say so periodically. A player must
-                            // establish clock sync before it can schedule anything, so
-                            // "how far along is this client's sync?" is the difference
-                            // between "the server isn't sending" and "the client isn't
-                            // ready yet" — a distinction that is otherwise invisible
-                            // from the server side, and the one an embedder debugging
-                            // silence-after-connect actually needs. Logged on the
-                            // exchanges where the answer changes shape (the first, then
-                            // sparsely), not every second.
-                            time_exchanges += 1;
-                            if time_exchanges == 1 || time_exchanges.is_multiple_of(10) {
-                                log::info!(
-                                    "[{client_id}] {time_exchanges} time exchange(s), {:.1}s since connect",
-                                    (server_received - connected_at_us) as f64 / 1e6
-                                );
-                            }
-                            last_time_reply_us = Some(server_received);
-                            if time_tx
-                                .send(Some(TimeRequest {
-                                    client_transmitted: t.client_transmitted,
-                                    server_received,
-                                }))
-                                .is_err()
-                            {
-                                break;
+                            // **Answer every `client/time`.** The spec puts the cadence
+                            // entirely in the client's hands ("The frequency of these
+                            // messages is determined by the client based on network
+                            // conditions and clock stability") and requires a reply to
+                            // each one ("Once received, the server responds with a
+                            // `server/time` message"). It grants a server no licence to
+                            // rate-limit, coalesce or ignore them; the only rate-limiting
+                            // licence in the spec is for a player's *timing updates* in
+                            // `client/state`, which is a different message.
+                            //
+                            // This code used to drop any request arriving within 50 ms of
+                            // the previous reply (`MIN_TIME_REPLY_INTERVAL_US`), on the
+                            // stated grounds that "the spec's cadence is about one
+                            // `client/time` per second". The spec has never said that, and
+                            // the reference implementation it points at sends a burst of
+                            // **8 back-to-back**, each waiting for its reply. The cost of
+                            // that mistake, measured on real hardware: an ESPHome player is
+                            // one-request-in-flight with a 10 s response timeout and *no
+                            // retransmit*, and it decodes nothing at all until its first
+                            // burst completes — so every dropped request bought 10 s of
+                            // total silence, and a reconnect cost 20-30 s, varying per
+                            // device with how its main loop straddled our 50 ms window.
+                            //
+                            // If this ever needs DoS hardening, it must be a bounded queue
+                            // that still *replies*, or a much larger budget-based limit —
+                            // never a silent drop. A client cannot distinguish "dropped"
+                            // from "network stalled", so silence is the most expensive
+                            // possible answer.
+                            time_received += 1;
+                            // Count received vs replied separately, and say so
+                            // periodically. A player must establish clock sync before it
+                            // can schedule anything, so "how far along is this client's
+                            // sync?" is the difference between "the server isn't sending"
+                            // and "the client isn't ready yet" — a distinction that is
+                            // otherwise invisible from the server side, and the one an
+                            // embedder debugging silence-after-connect actually needs.
+                            // Logged on the exchanges where the answer changes shape (the
+                            // first, then sparsely), not every second.
+                            //
+                            // `replied` is incremented only after the reply is actually
+                            // queued, so the two counters diverge exactly when we fail a
+                            // request — which is the whole point of having both.
+                            let req = TimeRequest {
+                                client_transmitted: t.client_transmitted,
+                                server_received,
+                            };
+                            match time_tx.try_send(req) {
+                                Ok(()) => {
+                                    time_replied += 1;
+                                    if time_replied == 1 || time_replied.is_multiple_of(10) {
+                                        // `received` and `replied` should stay equal; both are
+                                        // printed so a divergence shows up in the log instead of
+                                        // needing a code read to rule out.
+                                        log::info!(
+                                            "[{client_id}] {time_replied} time exchange(s) (received {time_received}), {:.1}s since connect",
+                                            (server_received - connected_at_us) as f64 / 1e6
+                                        );
+                                    }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // The bound exists so a flooding peer can't dictate
+                                    // our memory; hitting it means either the peer is
+                                    // pathological or our writer has stalled. Say so at
+                                    // WARN. The old code dropped at `trace`, which is how
+                                    // a 50 ms rate limit silently cost 20-30 s of audio
+                                    // for weeks without leaving a usable trace.
+                                    log::warn!(
+                                        "[{client_id}] time-reply queue full ({MAX_QUEUED_TIME_REPLIES}); \
+                                         dropping a client/time — the peer will see a stalled \
+                                         exchange. received={time_received} replied={time_replied}"
+                                    );
+                                    // Not counted as replied: the counters are the signal
+                                    // that this happened at all.
+                                    continue;
+                                }
                             }
                         }
                         Ok(Message::ClientHello(_)) => {
