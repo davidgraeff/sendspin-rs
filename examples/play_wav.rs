@@ -224,10 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_first_member(&group).await;
 
     if args.wait_secs > 0 {
-        println!(
-            "waiting up to {}s for additional clients (connect more devices now for a multi-room test)...",
-            args.wait_secs
-        );
+        println!("waiting up to {}s for additional clients (connect more devices now for a multi-room test)...", args.wait_secs);
         tokio::time::sleep(Duration::from_secs(args.wait_secs)).await;
     }
 
@@ -331,11 +328,23 @@ fn spawn_manager_loop(
                     client_id,
                     fullname,
                     active_roles,
+                    hello,
                     sender,
                 } => {
                     println!(
                         "[{client_id}] connected (dialed via {fullname}): roles={active_roles:?}"
                     );
+                    // What the device says it can decode. Printing it is half the
+                    // point of pointing this tool at real hardware: this tool
+                    // streams the WAV's own format unchanged, so a mismatch here
+                    // is why a device connects and then plays nothing.
+                    match hello.player_v1_support.as_ref() {
+                        Some(p) => println!(
+                            "[{client_id}] player@v1: buffer_capacity={} formats={:?}",
+                            p.buffer_capacity, p.supported_formats
+                        ),
+                        None => println!("[{client_id}] declared no player@v1 support"),
+                    }
                     if let Err(e) = group.add_member(client_id, sender).await {
                         println!("failed to add member to group: {e}");
                     }

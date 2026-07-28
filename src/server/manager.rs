@@ -1,7 +1,7 @@
 // ABOUTME: Continuous discovery + reconnect-with-backoff supervision for clients
 // ABOUTME: that only run their own embedded server (the supervised form of dial_client)
 
-use crate::protocol::messages::{ConnectionReason, Message};
+use crate::protocol::messages::{ClientHello, ConnectionReason, Message};
 use crate::server::connection::{ServerConnection, ServerSender};
 use crate::server::dial::dial_client_with_reason;
 use crate::server::discovery::{ClientBrowser, Discovered};
@@ -60,6 +60,15 @@ pub enum ClientEvent {
         fullname: String,
         /// Roles this server granted the client.
         active_roles: Vec<String>,
+        /// The client's own `client/hello` — its advertised capabilities
+        /// (`player@v1_support.supported_formats`, buffer capacity, supported
+        /// commands) and `device_info`. Forwarded because the manager owns the
+        /// connection internally, so a caller that never sees the
+        /// [`crate::server::ServerConnection`] would otherwise have no way to read
+        /// them — and without them a server cannot negotiate a codec/rate the
+        /// device actually supports (it can only guess). Boxed to keep the event
+        /// enum small.
+        hello: Box<ClientHello>,
         /// Sender for pushing stream/audio/command messages to this client.
         sender: ServerSender,
     },
@@ -334,6 +343,7 @@ async fn supervise(
                     client_id: client_id.clone(),
                     fullname: fullname.clone(),
                     active_roles: conn.active_roles().to_vec(),
+                    hello: Box::new(conn.hello().clone()),
                     sender: conn.sender(),
                 });
 
