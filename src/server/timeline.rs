@@ -35,6 +35,7 @@ pub struct SharedTimeline {
     state: Mutex<TimelineState>,
 }
 
+#[derive(Debug)]
 struct TimelineState {
     /// The format currently streaming, used to derive each chunk's duration.
     /// `None` before the first `start`/after `clear`.
@@ -45,6 +46,17 @@ struct TimelineState {
     /// Carry for the sub-microsecond part of a chunk's duration (numerator over
     /// the sample rate), so advancing the timeline doesn't accumulate drift.
     residue: i64,
+}
+
+impl std::fmt::Debug for SharedTimeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Arc<dyn Clock>` isn't Debug, and the clock's identity is not what a
+        // reader of this wants anyway.
+        f.debug_struct("SharedTimeline")
+            .field("send_ahead_us", &self.send_ahead_us)
+            .field("state", &*self.state())
+            .finish()
+    }
 }
 
 impl SharedTimeline {

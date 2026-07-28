@@ -40,21 +40,30 @@ mod discovery;
 mod group;
 mod listener;
 mod manager;
+mod role;
 mod timeline;
+mod writer;
 
-pub use binary::encode_audio_frame;
+pub use binary::{encode_audio_frame, AudioFrame};
 pub use connection::{
-    AudioEnqueue, QueuedControl, ServerConnection, ServerConnectionGuard, ServerSender,
-    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
+    AudioEnqueue, QueuedControl, ServerConnection, ServerConnectionGuard, ServerConnectionParts,
+    ServerSender, DEFAULT_HANDSHAKE_TIMEOUT,
 };
-pub use dial::{dial_client, dial_client_with_reason, dial_client_with_write_timeout};
 pub use discovery::{Advertisement, ClientBrowser, Discovered};
-pub use group::{Group, OwnsTimeline, SharesTimeline, DEFAULT_SEND_AHEAD_US};
+pub use group::{Group, OwnsTimeline, SharesTimeline};
 pub use listener::ServerListener;
 pub use manager::{ClientEvent, ClientManager};
-/// Re-export of the underlying mDNS daemon types so callers can build and
-/// configure one `ServiceDaemon` (e.g. restrict it to a single interface with
-/// [`IfKind`]) and share it across [`Advertisement`]/[`ClientBrowser`] via their
-/// `with_daemon` constructors, instead of each spawning its own daemon thread.
-pub use mdns_sd::{IfKind, ServiceDaemon};
-pub use timeline::SharedTimeline;
+/// Re-export of the mDNS crate this one is built on, so callers can construct and
+/// configure a `ServiceDaemon` — e.g. restrict it to a single interface with
+/// `IfKind` — and share it across [`Advertisement`]/[`ClientBrowser`] through their
+/// `with_daemon` constructors instead of each spawning its own daemon thread.
+///
+/// Re-exported whole rather than as a few cherry-picked types on purpose: those
+/// constructors only type-check if the caller's `mdns_sd` is the same version as
+/// this crate's, and going through `sendspin::server::mdns_sd` makes that true by
+/// construction. It also means `mdns_sd` is part of this crate's public API — a
+/// major or minor bump of it is a breaking change here and will be released as one.
+pub use mdns_sd;
+pub use role::ServerRole;
+pub use timeline::{SharedTimeline, DEFAULT_SEND_AHEAD_US};
+pub use writer::DEFAULT_WRITE_TIMEOUT;

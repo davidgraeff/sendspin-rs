@@ -9,7 +9,7 @@ mod common;
 use futures_util::{SinkExt, StreamExt};
 use mdns_sd::ServiceInfo;
 use sendspin::protocol::messages::{ClientHello, Message};
-use sendspin::server::{ClientEvent, ClientManager};
+use sendspin::server::{ClientEvent, ClientManager, ServerRole};
 use sendspin::DefaultClock;
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,11 +129,10 @@ async fn reconnects_after_the_client_drops_impl() {
     // unfiltered manager would also try to dial (and hold reconnect loops
     // against) those — noisy for the test and, worse, actively interferes
     // with hardware you might be using for something else at the time.
-    let (manager, mut events) = ClientManager::start_filtered(
-        "test-server",
-        "Test Server",
-        Arc::new(DefaultClock::default()),
+    let (manager, mut events) = ClientManager::start(
+        &ServerRole::new("test-server", "Test Server").clock(Arc::new(DefaultClock::default())),
         move |fullname| fullname.starts_with(&instance_name),
+        None,
     )
     .expect("start");
 
@@ -176,14 +175,13 @@ async fn redials_promptly_when_the_same_device_reappears_at_a_new_address_impl()
     let instance_name = format!("manager-test-address-change-{old_port}");
     let daemon = advertise(&instance_name, old_port);
 
-    let (manager, mut events) = ClientManager::start_filtered(
-        "test-server",
-        "Test Server",
-        Arc::new(DefaultClock::default()),
+    let (manager, mut events) = ClientManager::start(
+        &ServerRole::new("test-server", "Test Server").clock(Arc::new(DefaultClock::default())),
         {
             let instance_name = instance_name.clone();
             move |fullname| fullname.starts_with(&instance_name)
         },
+        None,
     )
     .expect("start");
 

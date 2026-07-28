@@ -3,7 +3,7 @@
 
 use crate::error::Error;
 use crate::protocol::messages::{PlayerCommand, StreamPlayerConfig};
-use crate::server::binary::encode_audio_frame;
+use crate::server::binary::{encode_audio_frame, AudioFrame};
 use crate::server::connection::{AudioEnqueue, QueuedControl, ServerSender};
 use crate::server::timeline::SharedTimeline;
 use crate::sync::raw_clock::Clock;
@@ -11,11 +11,6 @@ use futures_util::future::join_all;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
-use tokio_tungstenite::tungstenite::Bytes;
-
-// Re-exported here for source compatibility; the constant now lives with the
-// timeline it parameterizes.
-pub use crate::server::timeline::DEFAULT_SEND_AHEAD_US;
 
 /// Marker for a group that owns its timeline and may therefore re-anchor or clear
 /// it. See [`Group`].
@@ -52,7 +47,7 @@ pub struct SharesTimeline;
 /// independently (duck/overlay/route one member without the others). In that
 /// mode the caller stamps the timeline **once** per chunk
 /// ([`SharedTimeline::stamp`]) and delivers the result to each group via
-/// [`Group::push_encoded`], instead of calling [`Group::push_audio`] per group
+/// [`Group::push_at`], instead of calling [`Group::push_audio`] per group
 /// (which would advance the shared timeline once per group).
 ///
 /// Which of those two modes a group is in is part of its **type**, so the mistake
@@ -60,7 +55,7 @@ pub struct SharesTimeline;
 /// exist only on `Group<`[`OwnsTimeline`]`>`, because each of them mutates the
 /// timeline and would desync every other group sharing it. A
 /// `Group<`[`SharesTimeline`]`>` has [`Group::broadcast_stream_start`] /
-/// [`Group::broadcast_stream_end`] / [`Group::push_encoded`] instead, and the
+/// [`Group::broadcast_stream_end`] / [`Group::push_at`] instead, and the
 /// coordinator drives the timeline itself.
 ///
 /// v1 scope: one shared PCM format for the whole group — no per-client
@@ -68,13 +63,14 @@ pub struct SharesTimeline;
 /// limitation, not silently-wrong audio. No late-join catch-up (a client
 /// added mid-stream just gets `stream/start` and audio from that point
 /// forward) and no historical buffer replay.
+#[derive(Debug)]
 pub struct Group<Timeline = OwnsTimeline> {
     timeline: Arc<SharedTimeline>,
     /// The group's members — and, deliberately, its **ordering point**.
     ///
     /// Every frame this group queues for a member, control or audio, is queued
     /// while this lock is held: `stream/start`/`stream/end` in the lifecycle
-    /// calls, audio in [`Group::push_encoded`]. Queueing is synchronous
+    /// calls, audio in [`Group::push_at`]. Queueing is synchronous
     /// (`ServerSender::queue_*` / `enqueue_audio` never await), so holding one
     /// lock across it is enough to give every member the same, valid order — and
     /// no `await` ever happens while it's held, which a `std::sync::Mutex` makes
@@ -167,7 +163,7 @@ impl Group<OwnsTimeline> {
     ///
     /// Only exists on a timeline-owning group — when several groups share one
     /// timeline, stamping per group would advance it once per group instead of
-    /// once per chunk. Stamp it yourself and use [`Self::push_encoded`].
+    /// once per chunk. Stamp it yourself and use [`Self::push_at`].
     pub fn push_audio(&self, pcm: &[u8]) -> i64 {
         self.push_audio_impl(pcm)
     }
@@ -235,7 +231,7 @@ impl<Timeline> Group<Timeline> {
     /// existing members (no late-join catch-up in v1, see the type docs).
     ///
     /// The new member's `stream/start` is queued *and* the member inserted under
-    /// one lock, so a concurrent [`Self::push_encoded`] can't slip audio in
+    /// one lock, so a concurrent [`Self::push_at`] can't slip audio in
     /// ahead of it. If the `stream/start` write then fails, the member is
     /// removed again and the error returned.
     pub async fn add_member(
@@ -277,21 +273,14 @@ impl<Timeline> Group<Timeline> {
     /// Safe on an owned timeline too, where it simply means "re-announce the
     /// stream without re-anchoring".
     pub async fn broadcast_stream_start(&self, config: StreamPlayerConfig) {
-        let queued = {
-            let members = self.members();
-            Self::queue_each(&members, |sender| sender.queue_stream_start(config.clone()))
-        };
-        self.settle(queued).await;
+        self.broadcast(|sender| sender.queue_stream_start(config.clone()))
+            .await;
     }
 
     /// Send `stream/end` to every current member **without** touching the
     /// timeline — the shared-timeline counterpart to [`Self::end_stream`].
     pub async fn broadcast_stream_end(&self) {
-        let queued = {
-            let members = self.members();
-            Self::queue_each(&members, |sender| sender.queue_stream_end())
-        };
-        self.settle(queued).await;
+        self.broadcast(|sender| sender.queue_stream_end()).await;
     }
 
     /// Ask every member to discard buffered-but-unplayed audio (e.g. after a
@@ -299,17 +288,13 @@ impl<Timeline> Group<Timeline> {
     /// dropped rather than written after the `stream/clear`. Does not touch the
     /// timeline — see `Group::clear_stream` on a timeline-owning group.
     pub async fn broadcast_stream_clear(&self) {
-        let queued = {
-            let members = self.members();
-            Self::queue_each(&members, |sender| sender.queue_stream_clear())
-        };
-        self.settle(queued).await;
+        self.broadcast(|sender| sender.queue_stream_clear()).await;
     }
 
     /// Push one PCM chunk to every member: stamp the timeline once, then fan
     /// the identical frame out. Returns that timestamp. Use this for a group
     /// that owns its timeline. When several groups share one timeline, stamp it
-    /// yourself once per chunk and call [`Group::push_encoded`] per group so the
+    /// yourself once per chunk and call [`Group::push_at`] per group so the
     /// timeline advances only once. Enqueue is non-blocking, so one slow member
     /// never delays the others; a member whose connection has died is pruned.
     pub(crate) fn push_audio_impl(&self, pcm: &[u8]) -> i64 {
@@ -324,32 +309,32 @@ impl<Timeline> Group<Timeline> {
     }
 
     /// Fan one PCM chunk out to every member at a caller-supplied timestamp,
-    /// **without** advancing the timeline. This is the shared-timeline path:
+    /// **without** advancing the timeline. (Named for what is pre-supplied — the
+    /// timestamp; the encoding happens here.) This is the shared-timeline path:
     /// the caller stamps a shared [`SharedTimeline`] once and delivers that one
     /// `ts` to each group/sender, so every member's chunk-N carries an
     /// identical timestamp. (For a group that owns its timeline, prefer
     /// [`Group::push_audio`], which stamps and fans in one call.)
-    pub fn push_encoded(&self, ts: i64, pcm: &[u8]) {
+    pub fn push_at(&self, ts: i64, pcm: &[u8]) {
         // Encode *before* taking the lock. The frame is a pure function of
         // (ts, pcm) and observable to nobody, so this does not weaken the ordering
         // guarantee — the enqueue still happens under the lock, synchronously —
         // but it keeps an allocation and a full payload copy out of a critical
         // section that a SCHED_FIFO producer may be waiting on.
-        let frame: Bytes = encode_audio_frame(ts, pcm).into();
+        let frame = encode_audio_frame(ts, pcm);
         let mut members = self.members();
         Self::fan_out_frame(&mut members, frame);
     }
 
     /// Encode, then fan out. Only used where the timestamp is produced under the
-    /// same lock ([`Self::push_audio`]); [`Self::push_encoded`] encodes outside it.
+    /// same lock ([`Self::push_audio`]); [`Self::push_at`] encodes outside it.
     fn fan_out(members: &mut HashMap<String, ServerSender>, ts: i64, pcm: &[u8]) {
-        let frame: Bytes = encode_audio_frame(ts, pcm).into();
-        Self::fan_out_frame(members, frame);
+        Self::fan_out_frame(members, encode_audio_frame(ts, pcm));
     }
 
     /// Fan one already-encoded frame out to every member as cheap refcount clones,
     /// and prune members whose connection has died.
-    fn fan_out_frame(members: &mut HashMap<String, ServerSender>, frame: Bytes) {
+    fn fan_out_frame(members: &mut HashMap<String, ServerSender>, frame: AudioFrame) {
         let mut dead = Vec::new();
         // Hand the buffer to the *last* member rather than cloning for it. With a
         // single member — the per-device topology this exists to serve — that means
@@ -363,12 +348,12 @@ impl<Timeline> Group<Timeline> {
             } else {
                 frame.clone().expect("frame is owned until the last member")
             };
-            match sender.enqueue_audio(this) {
-                Ok(AudioEnqueue::Sent) => {}
-                Ok(AudioEnqueue::Evicted) => {
+            match sender.queue_audio(this) {
+                AudioEnqueue::Queued => {}
+                AudioEnqueue::Dropped => {
                     log::trace!("group member {id} audio backlog full, dropping chunk")
                 }
-                Err(_) => dead.push(id.clone()),
+                AudioEnqueue::Disconnected => dead.push(id.clone()),
             }
         }
         for id in dead {
@@ -381,11 +366,20 @@ impl<Timeline> Group<Timeline> {
     /// member. Player commands are independent of the stream, so they overtake
     /// queued audio instead of waiting behind it.
     pub async fn send_player_command(&self, command: PlayerCommand) {
+        self.broadcast(|sender| sender.queue_player_command(command.clone()))
+            .await;
+    }
+
+    /// Queue one control frame per member under the member lock, then await the
+    /// writes with the lock released.
+    ///
+    /// Every lifecycle broadcast goes through here so the lock discipline that makes
+    /// frame order authoritative — queue synchronously while holding it, never await
+    /// under it — exists in exactly one place.
+    async fn broadcast(&self, queue: impl Fn(&ServerSender) -> QueuedControl) {
         let queued = {
             let members = self.members();
-            Self::queue_each(&members, |sender| {
-                sender.queue_player_command(command.clone())
-            })
+            Self::queue_each(&members, queue)
         };
         self.settle(queued).await;
     }

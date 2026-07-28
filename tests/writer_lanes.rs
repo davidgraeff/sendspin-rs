@@ -1,80 +1,32 @@
-// ABOUTME: Integration tests for the per-connection writer's two lanes:
-// ABOUTME: control frames never wait behind queued audio, a stalled socket can't
-// ABOUTME: park control or close forever, and lifecycle/audio order stays valid.
+// ABOUTME: Integration tests for the per-connection writer's lanes: control frames
+// ABOUTME: never wait behind queued audio, a peer cannot exhaust or starve the
+// ABOUTME: server, and lifecycle frames stay correctly ordered against audio.
 
+mod common;
+
+use common::{
+    accept_peer, bind_test_listener, bind_test_listener_with, connect_peer, drain, pcm_config,
+    pcm_config_at, test_hello, volume, Frame, PeerRead,
+};
 use futures_util::{SinkExt, StreamExt};
 use sendspin::protocol::client::AudioChunk;
-use sendspin::protocol::messages::{
-    ClientHello, Message, PlayerCommand, PlayerCommandType, StreamPlayerConfig,
-};
-use sendspin::server::{AudioEnqueue, Group, ServerSender};
-use sendspin::ServerListener;
+use sendspin::protocol::messages::Message;
+use sendspin::server::{AudioEnqueue, Group, ServerRole, ServerSender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Loop bound for "push until the backlog caps" probes.
-const MAX_BACKLOG_PROBE: usize = 200;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
-type PeerRead = futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
->;
-
-fn test_hello(client_id: &str) -> ClientHello {
-    ClientHello {
-        client_id: client_id.to_string(),
-        name: "Test Player".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    }
-}
-
-/// Connects a bare peer that plays the client role manually and then reads
-/// nothing further until the test asks it to — which is what lets these tests
-/// control exactly how much the server's socket can drain.
-async fn connect_peer(url: &str, client_id: &str) -> PeerRead {
-    let (ws, _) = connect_async(url).await.expect("ws connect");
-    let (mut write, mut read) = ws.split();
-    let hello = serde_json::to_string(&Message::ClientHello(test_hello(client_id))).unwrap();
-    write.send(WsMessage::Text(hello.into())).await.unwrap();
-    read.next().await.expect("no server/hello").unwrap(); // discard server/hello
-    read
-}
-
-fn pcm_config() -> StreamPlayerConfig {
-    StreamPlayerConfig {
-        codec: "pcm".to_string(),
-        sample_rate: 48000,
-        channels: 2,
-        bit_depth: 16,
-        codec_header: None,
-    }
-}
-
-fn volume(v: u8) -> PlayerCommand {
-    PlayerCommand {
-        command: PlayerCommandType::Volume,
-        volume: Some(v),
-        mute: None,
-        static_delay_ms: None,
-    }
-}
+/// Loop bound for "push until the backlog caps" probes.
+const MAX_BACKLOG_PROBE: usize = 200;
 
 /// Queue `count` small audio frames whose payload encodes their index, so a test
 /// can assert they arrive in push order.
 fn enqueue_marked_audio(sender: &ServerSender, count: u8) {
     for i in 0..count {
         let frame = sendspin::server::encode_audio_frame(1_000 + i as i64, &[i; 8]);
-        assert_eq!(
-            sender.enqueue_audio(frame.into()).expect("enqueue"),
-            AudioEnqueue::Sent
-        );
+        assert_eq!(sender.queue_audio(frame), AudioEnqueue::Queued);
     }
 }
 
@@ -88,24 +40,15 @@ fn enqueue_marked_audio(sender: &ServerSender, count: u8) {
 /// under test.
 #[tokio::test]
 async fn a_player_command_does_not_wait_behind_queued_audio() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let peer = tokio::spawn({
-        let url = format!("ws://{addr}");
-        async move { connect_peer(&url, "member").await }
-    });
-    let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut read = peer.await.unwrap();
+    let (listener, url) = bind_test_listener().await;
+    let (conn, mut read) = accept_peer(&listener, &url, "member").await;
 
     let sender = conn.sender();
     enqueue_marked_audio(&sender, 5);
-    let queued_command = sender.queue_player_command(volume(42));
-    queued_command.written().await.expect("command written");
+    sender
+        .queue_player_command(volume(42))
+        .await
+        .expect("command written");
 
     // The command overtook all five queued frames...
     let first = timeout(Duration::from_secs(5), read.next())
@@ -155,13 +98,12 @@ async fn a_player_command_does_not_wait_behind_queued_audio() {
 async fn a_stalled_socket_fails_control_and_close_instead_of_hanging() {
     // 200ms rather than the 5s default so the test doesn't have to wait it out.
     let write_timeout = Duration::from_millis(200);
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind")
-        .write_timeout(write_timeout);
-    let addr = listener.local_addr().expect("local_addr");
+    let (listener, url) = bind_test_listener_with(
+        ServerRole::new("test-server", "Test Server").write_timeout(write_timeout),
+    )
+    .await;
     let peer = tokio::spawn({
-        let url = format!("ws://{addr}");
+        let url = url.clone();
         async move { connect_peer(&url, "stalled-member").await }
     });
     let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
@@ -180,13 +122,13 @@ async fn a_stalled_socket_fails_control_and_close_instead_of_hanging() {
     let mut stalled = false;
     for _ in 0..200 {
         let frame = sendspin::server::encode_audio_frame(1_000, &big);
-        match sender.enqueue_audio(frame.into()) {
-            Ok(AudioEnqueue::Sent) => tokio::task::yield_now().await,
-            Ok(AudioEnqueue::Evicted) => {
+        match sender.queue_audio(frame) {
+            AudioEnqueue::Queued => tokio::task::yield_now().await,
+            AudioEnqueue::Dropped => {
                 stalled = true;
                 break;
             }
-            Err(e) => panic!("connection died before it could stall: {e}"),
+            AudioEnqueue::Disconnected => panic!("connection died before it could stall"),
         }
     }
     assert!(
@@ -200,7 +142,7 @@ async fn a_stalled_socket_fails_control_and_close_instead_of_hanging() {
     let started = Instant::now();
     let result = timeout(
         Duration::from_secs(10),
-        sender.send_player_command(volume(30)),
+        sender.queue_player_command(volume(30)),
     )
     .await;
     let elapsed = started.elapsed();
@@ -226,64 +168,16 @@ async fn a_stalled_socket_fails_control_and_close_instead_of_hanging() {
     );
 }
 
-/// Set up a listener plus one connected, non-reading peer and a single-member
-/// group, returning the pieces the ordering tests need.
-async fn one_member_group() -> (Group, sendspin::ServerConnection, PeerRead) {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let peer = tokio::spawn({
-        let url = format!("ws://{addr}");
-        async move { connect_peer(&url, "member").await }
-    });
-    let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let read = peer.await.unwrap();
+/// A listener, one connected non-reading peer, and a single-member group.
+async fn one_member_group() -> (Group, sendspin::server::ServerConnection, PeerRead) {
+    let (listener, url) = bind_test_listener().await;
+    let (conn, read) = accept_peer(&listener, &url, "member").await;
     let group = Group::new(Arc::new(sendspin::DefaultClock::default()));
     group
         .add_member(conn.client_id().to_string(), conn.sender())
         .await
         .unwrap();
     (group, conn, read)
-}
-
-/// What a client actually observed, reduced to the part these tests care about:
-/// the order of lifecycle frames and audio payloads.
-#[derive(Debug, PartialEq, Eq)]
-enum Frame {
-    /// `stream/start`, carrying the sample rate so a format change is visible.
-    Start(u32),
-    End,
-    Clear,
-    /// One audio frame, identified by its (uniform) first payload byte.
-    Audio(u8),
-}
-
-/// Drain everything the peer has been sent, until the close frame.
-async fn drain(read: &mut PeerRead) -> Vec<Frame> {
-    let mut out = Vec::new();
-    while let Ok(Some(Ok(msg))) = timeout(Duration::from_secs(5), read.next()).await {
-        match msg {
-            WsMessage::Text(text) => match serde_json::from_str::<Message>(&text).unwrap() {
-                Message::StreamStart(s) => {
-                    out.push(Frame::Start(s.player.expect("player config").sample_rate))
-                }
-                Message::StreamEnd(_) => out.push(Frame::End),
-                Message::StreamClear(_) => out.push(Frame::Clear),
-                _ => {}
-            },
-            WsMessage::Binary(bytes) => {
-                let chunk = AudioChunk::from_bytes(&bytes).unwrap();
-                out.push(Frame::Audio(chunk.data[0]));
-            }
-            WsMessage::Close(_) => break,
-            _ => {}
-        }
-    }
-    out
 }
 
 /// `stream/end` means "after everything I sent", so it must **not** overtake the
@@ -331,10 +225,7 @@ async fn audio_from_a_superseded_stream_is_dropped_at_the_next_stream_start() {
     for _ in 0..5 {
         group.push_audio(&[0xAA; 8]);
     }
-    let restarted = StreamPlayerConfig {
-        sample_rate: 44100,
-        ..pcm_config()
-    };
+    let restarted = pcm_config_at(44_100);
     group.start_stream(restarted).await;
     group.push_audio(&[0xBB; 8]);
     // `disconnect` discards whatever audio is still queued, so park the read half
@@ -453,16 +344,11 @@ async fn lifecycle_frames_stay_paired_while_another_thread_pushes() {
 /// keeps flowing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_time_flood_neither_grows_nor_starves_the_audio_lane() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
+    let (listener, url) = bind_test_listener().await;
 
     // The peer floods client/time as fast as it can while reading replies.
     let peer = tokio::spawn(async move {
-        let (ws, _) = connect_async(format!("ws://{addr}"))
-            .await
-            .expect("ws connect");
+        let (ws, _) = connect_async(url.clone()).await.expect("ws connect");
         let (mut write, mut read) = ws.split();
         let hello = serde_json::to_string(&Message::ClientHello(test_hello("flooder"))).unwrap();
         write.send(WsMessage::Text(hello.into())).await.unwrap();
@@ -541,19 +427,8 @@ async fn a_client_time_flood_neither_grows_nor_starves_the_audio_lane() {
 /// audio, no `Disconnected`, no re-dial, nothing logged above `trace`.
 #[tokio::test]
 async fn a_dead_writer_is_reported_even_with_a_full_backlog() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    let peer = tokio::spawn({
-        let url = format!("ws://{addr}");
-        async move { connect_peer(&url, "member").await }
-    });
-    let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let _read = peer.await.unwrap();
+    let (listener, url) = bind_test_listener().await;
+    let (conn, _read) = accept_peer(&listener, &url, "member").await;
     let sender = conn.sender();
 
     // Fill the lane with no await in between, so the writer has not run: the cap is
@@ -561,12 +436,13 @@ async fn a_dead_writer_is_reported_even_with_a_full_backlog() {
     let mut capped = false;
     for _ in 0..MAX_BACKLOG_PROBE {
         let frame = sendspin::server::encode_audio_frame(1, &[0u8; 64]);
-        match sender.enqueue_audio(frame.into()).expect("enqueue") {
-            AudioEnqueue::Sent => {}
-            AudioEnqueue::Evicted => {
+        match sender.queue_audio(frame) {
+            AudioEnqueue::Queued => {}
+            AudioEnqueue::Dropped => {
                 capped = true;
                 break;
             }
+            AudioEnqueue::Disconnected => panic!("connection died before the cap was reached"),
         }
     }
     assert!(capped, "expected the backlog to reach its cap");
@@ -578,7 +454,7 @@ async fn a_dead_writer_is_reported_even_with_a_full_backlog() {
 
     let frame = sendspin::server::encode_audio_frame(2, &[0u8; 8]);
     assert!(
-        sender.enqueue_audio(frame.into()).is_err(),
+        sender.queue_audio(frame) == AudioEnqueue::Disconnected,
         "a full backlog hid a dead writer — the member would never be pruned"
     );
 }
@@ -591,19 +467,19 @@ async fn a_dead_writer_is_reported_even_with_a_full_backlog() {
 /// supervisor with no backoff progression.
 #[tokio::test]
 async fn a_silent_peer_fails_its_handshake_without_blocking_the_next_one() {
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind")
-        .handshake_timeout(Duration::from_millis(300));
-    let addr = listener.local_addr().expect("local_addr");
+    let (listener, url) = bind_test_listener_with(
+        ServerRole::new("test-server", "Test Server").handshake_timeout(Duration::from_millis(300)),
+    )
+    .await;
 
     // Connects, never sends client/hello, and stays connected.
-    let silent = tokio::spawn(async move {
-        let (ws, _) = connect_async(format!("ws://{addr}"))
-            .await
-            .expect("connect");
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        drop(ws);
+    let silent = tokio::spawn({
+        let url = url.clone();
+        async move {
+            let (ws, _) = connect_async(url).await.expect("connect");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            drop(ws);
+        }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -625,7 +501,7 @@ async fn a_silent_peer_fails_its_handshake_without_blocking_the_next_one() {
 
     // The listener is still usable: a well-behaved peer connects right after.
     let good = tokio::spawn({
-        let url = format!("ws://{addr}");
+        let url = url.clone();
         async move { connect_peer(&url, "good-member").await }
     });
     let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
@@ -647,18 +523,15 @@ async fn a_silent_peer_fails_its_handshake_without_blocking_the_next_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_end_stays_bounded_against_a_slow_peer() {
     let write_timeout = Duration::from_millis(300);
-    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
-        .await
-        .expect("bind")
-        .write_timeout(write_timeout);
-    let addr = listener.local_addr().expect("local_addr");
+    let (listener, url) = bind_test_listener_with(
+        ServerRole::new("test-server", "Test Server").write_timeout(write_timeout),
+    )
+    .await;
 
     // Drains one message per 120ms: never stalls a single write, but far too slow
     // to clear a full backlog inside one timeout.
     let peer = tokio::spawn(async move {
-        let (ws, _) = connect_async(format!("ws://{addr}"))
-            .await
-            .expect("connect");
+        let (ws, _) = connect_async(url.clone()).await.expect("connect");
         let (mut write, mut read) = ws.split();
         let hello = serde_json::to_string(&Message::ClientHello(test_hello("slow"))).unwrap();
         write.send(WsMessage::Text(hello.into())).await.unwrap();
@@ -680,15 +553,15 @@ async fn stream_end_stays_bounded_against_a_slow_peer() {
     for _ in 0..MAX_BACKLOG_PROBE {
         let frame = sendspin::server::encode_audio_frame(1, &big);
         if matches!(
-            sender.enqueue_audio(frame.into()),
-            Ok(AudioEnqueue::Evicted) | Err(_)
+            sender.queue_audio(frame),
+            AudioEnqueue::Dropped | AudioEnqueue::Disconnected
         ) {
             break;
         }
     }
 
     let started = Instant::now();
-    let _ = timeout(Duration::from_secs(20), sender.send_stream_end()).await;
+    let _ = timeout(Duration::from_secs(20), sender.queue_stream_end()).await;
     let elapsed = started.elapsed();
     assert!(
         elapsed < 4 * write_timeout,

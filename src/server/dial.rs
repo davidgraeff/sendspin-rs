@@ -3,112 +3,28 @@
 // ABOUTME: themselves) — discovered via discovery::ClientBrowser, dialed here.
 
 use crate::error::Error;
-use crate::protocol::messages::ConnectionReason;
-use crate::server::connection::{
-    ServerConnection, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
-};
-use crate::sync::raw_clock::Clock;
-use std::sync::Arc;
-use std::time::Duration;
+use crate::server::connection::ServerConnection;
+use crate::server::listener::transport_config;
+use crate::server::role::ServerRole;
 use tokio_tungstenite::connect_async_with_config;
 
-/// Dial a Sendspin client's own WebSocket server (e.g. a URL discovered via
-/// [`crate::server::ClientBrowser`]) and drive the server-role handshake over
-/// the resulting connection.
+/// Dial `url` and drive the server-role handshake over the connection.
 ///
-/// The protocol-level roles are identical regardless of which side initiated
-/// the TCP connection — the client still sends `client/hello` first, this
-/// still replies `server/hello` — so this is otherwise exactly
-/// [`crate::server::ServerListener::accept`]'s handshake, just dialed instead
-/// of accepted. `sendspin-rs`'s own `protocol::listener::ProtocolListener` is
-/// the client-role mirror of this for the reverse case (a client accepting a
-/// server that dials in).
-pub async fn dial_client(
-    url: &str,
-    server_id: &str,
-    server_name: &str,
-    clock: Arc<dyn Clock>,
-) -> Result<ServerConnection, Error> {
-    dial_client_with_write_timeout(url, server_id, server_name, clock, DEFAULT_WRITE_TIMEOUT).await
-}
-
-/// [`dial_client`] with an explicit [`ConnectionReason`].
-///
-/// The spec lets several servers connect to one client and leaves the
-/// keep-or-switch policy to the *client*, which weighs each server's
-/// `connection_reason` (see `protocol::listener::ProtocolListener`). A server
-/// that dials merely to **be ready** — so an announcement or a control command
-/// can reach an otherwise-idle device without paying a cold connect — should say
-/// [`ConnectionReason::Discovery`] ("discovery/announcement"), not
-/// [`ConnectionReason::Playback`]: claiming Playback while streaming nothing (or
-/// nothing but silence) makes such a server look like the active one and can keep
-/// the device from switching to a server the user actually asked to play.
-/// [`dial_client`] keeps announcing Playback, which is right for a dial made in
-/// order to stream.
-pub async fn dial_client_with_reason(
-    url: &str,
-    server_id: &str,
-    server_name: &str,
-    clock: Arc<dyn Clock>,
-    reason: ConnectionReason,
-) -> Result<ServerConnection, Error> {
-    dial_client_inner(
-        url,
-        server_id,
-        server_name,
-        clock,
-        DEFAULT_WRITE_TIMEOUT,
-        reason,
-    )
-    .await
-}
-
-/// [`dial_client`] with an explicit per-write deadline instead of
-/// [`crate::server::DEFAULT_WRITE_TIMEOUT`] — see that constant for why writes
-/// are bounded at all.
-pub async fn dial_client_with_write_timeout(
-    url: &str,
-    server_id: &str,
-    server_name: &str,
-    clock: Arc<dyn Clock>,
-    write_timeout: Duration,
-) -> Result<ServerConnection, Error> {
-    // The server dialed out to stream to this client, so announce Playback.
-    // `dial_client_with_reason` covers the be-ready-only case.
-    dial_client_inner(
-        url,
-        server_id,
-        server_name,
-        clock,
-        write_timeout,
-        ConnectionReason::Playback,
-    )
-    .await
-}
-
-async fn dial_client_inner(
-    url: &str,
-    server_id: &str,
-    server_name: &str,
-    clock: Arc<dyn Clock>,
-    write_timeout: Duration,
-    reason: ConnectionReason,
-) -> Result<ServerConnection, Error> {
-    let (ws, _response) = connect_async_with_config(
-        url,
-        Some(crate::server::listener::transport_config()),
-        false,
-    )
-    .await
-    .map_err(|e| Error::Connection(format!("dial to {url} failed: {e}")))?;
+/// Reached through [`ServerRole::dial`], which is where the identity, the
+/// deadlines and the announced [`crate::protocol::messages::ConnectionReason`]
+/// come from.
+pub(crate) async fn dial(role: &ServerRole, url: &str) -> Result<ServerConnection, Error> {
+    let (ws, _response) = connect_async_with_config(url, Some(transport_config()), false)
+        .await
+        .map_err(|e| Error::Connection(format!("dial to {url} failed: {e}")))?;
     ServerConnection::drive(
         ws,
-        server_id,
-        server_name,
-        reason,
-        clock,
-        write_timeout,
-        DEFAULT_HANDSHAKE_TIMEOUT,
+        &role.server_id,
+        &role.server_name,
+        role.connection_reason.clone(),
+        std::sync::Arc::clone(&role.clock),
+        role.write_timeout,
+        role.handshake_timeout,
     )
     .await
 }

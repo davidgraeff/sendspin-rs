@@ -1,11 +1,10 @@
 // ABOUTME: Continuous discovery + reconnect-with-backoff supervision for clients
 // ABOUTME: that only run their own embedded server (the supervised form of dial_client)
 
-use crate::protocol::messages::{ClientHello, ConnectionReason, Message};
+use crate::protocol::messages::{ClientHello, Message};
 use crate::server::connection::{ServerConnection, ServerSender};
-use crate::server::dial::dial_client_with_reason;
 use crate::server::discovery::{ClientBrowser, Discovered};
-use crate::sync::raw_clock::Clock;
+use crate::server::role::ServerRole;
 use mdns_sd::ServiceDaemon;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,11 +32,9 @@ enum Directive {
     /// (Re)dial the client at this URL. A new URL for an already-connected
     /// client makes the supervisor drop the current connection and redial.
     Dial(String),
-    /// Stop supervising this client and end its task. Nothing sends this today,
-    /// because an mDNS removal is a possible power-save lapse rather than proof
-    /// of departure (see `Discovered::Removed`); `supervise` honours it so that
-    /// an explicit "stop supervising this device" needs no new plumbing.
-    #[allow(dead_code)]
+    /// Stop supervising this client and end its task. Sent only by
+    /// [`ClientManager::stop_client`] — an mDNS removal is a possible power-save
+    /// lapse rather than proof of departure, so it does not imply this.
     Stop,
 }
 
@@ -81,9 +78,10 @@ pub enum ClientEvent {
         /// The message itself.
         message: Box<Message>,
     },
-    /// The client disconnected. If it's still discoverable, a reconnect
-    /// attempt is already running in the background — this just tells the
-    /// caller to stop treating `client_id` as a live group member for now.
+    /// The client disconnected. A reconnect attempt is already running in the
+    /// background — unconditionally, since supervision outlives an mDNS lapse — so
+    /// this just tells the caller to stop treating `client_id` as a live group
+    /// member for now.
     Disconnected {
         /// The client that disconnected.
         client_id: String,
@@ -98,85 +96,37 @@ struct ManagedClient {
 
 /// Discovers Sendspin clients that only run their own embedded server and keeps
 /// each one connected: dials on discovery, retries with capped exponential
-/// backoff on failure or disconnect, re-dials promptly if a device reappears at
-/// a new address, and stops supervising once a device's mDNS advertisement is
-/// removed.
+/// backoff on failure or disconnect, and re-dials promptly if a device reappears
+/// at a new address. A device whose mDNS advertisement lapses keeps its supervisor
+/// — see `Discovered::Removed` in the browse loop for why — so supervision ends
+/// only when the caller asks for it ([`ClientManager::stop_client`]) or the manager
+/// is dropped.
 pub struct ClientManager {
     tasks: Arc<Mutex<HashMap<String, ManagedClient>>>,
     browse_handle: JoinHandle<()>,
 }
 
 impl ClientManager {
-    /// Start discovering and managing every Sendspin client this process can
-    /// see on the network. Returns immediately; events arrive on the
-    /// returned receiver as they happen. Drop the returned `ClientManager`
-    /// to stop discovery and every reconnect loop it's running.
+    /// Start discovering and managing Sendspin clients using `role`'s identity and
+    /// connection settings. Returns immediately; events arrive on the returned
+    /// receiver as they happen. Drop the returned `ClientManager` to stop discovery
+    /// and every reconnect loop it is running.
     ///
-    /// This is unfiltered: on a LAN where other servers already serve some of
-    /// these clients, you will compete with them for those devices. Use
-    /// [`Self::start_filtered`] to scope discovery to a known set of devices.
+    /// `allow` scopes discovery by mDNS instance full name (e.g.
+    /// `my-device._sendspin._tcp.local.`). Accepting everything is rarely what you
+    /// want on a LAN where other servers already serve some of those clients — you
+    /// will compete with them for the devices.
+    ///
+    /// `daemon` lets an embedder share one mDNS `ServiceDaemon` (see
+    /// [`ClientBrowser::with_daemon`]) across all of its mDNS rather than adding a
+    /// daemon thread — and, under host networking, its multicast amplification —
+    /// per manager. `None` spawns a private one.
     pub fn start(
-        server_id: impl Into<String>,
-        server_name: impl Into<String>,
-        clock: Arc<dyn Clock>,
-    ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
-        Self::start_filtered(server_id, server_name, clock, |_fullname| true)
-    }
-
-    /// Like [`Self::start`], but only discovers and manages clients whose
-    /// mDNS instance full name (e.g. `my-device._sendspin._tcp.local.`)
-    /// satisfies `allow`.
-    pub fn start_filtered(
-        server_id: impl Into<String>,
-        server_name: impl Into<String>,
-        clock: Arc<dyn Clock>,
-        allow: impl Fn(&str) -> bool + Send + 'static,
-    ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
-        Self::start_filtered_with_daemon(server_id, server_name, clock, allow, None)
-    }
-
-    /// Like [`Self::start_filtered`], but browses on a **caller-provided** mDNS
-    /// daemon (see [`ClientBrowser::with_daemon`]) instead of spawning its own —
-    /// so an embedder can share one interface-restricted daemon across all of
-    /// its mDNS instead of adding a `mDNS_daemon` thread (and, under
-    /// host-networking, its multicast amplification) per manager. Passing `None`
-    /// is exactly [`Self::start_filtered`].
-    pub fn start_filtered_with_daemon(
-        server_id: impl Into<String>,
-        server_name: impl Into<String>,
-        clock: Arc<dyn Clock>,
+        role: &ServerRole,
         allow: impl Fn(&str) -> bool + Send + 'static,
         daemon: Option<ServiceDaemon>,
     ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
-        Self::start_filtered_with_daemon_reason(
-            server_id,
-            server_name,
-            clock,
-            allow,
-            daemon,
-            ConnectionReason::Playback,
-        )
-    }
-
-    /// Like [`Self::start_filtered_with_daemon`], but every dial announces
-    /// `reason` instead of [`ConnectionReason::Playback`].
-    ///
-    /// Pass [`ConnectionReason::Discovery`] for a manager that keeps devices
-    /// connected merely to **be ready** (announcements, control commands) rather
-    /// than to stream: the client's keep-or-switch policy weighs this, so a
-    /// be-ready manager that claimed Playback could stop the device from switching
-    /// to a server the user actually asked to play. See
-    /// [`crate::server::dial_client_with_reason`].
-    pub fn start_filtered_with_daemon_reason(
-        server_id: impl Into<String>,
-        server_name: impl Into<String>,
-        clock: Arc<dyn Clock>,
-        allow: impl Fn(&str) -> bool + Send + 'static,
-        daemon: Option<ServiceDaemon>,
-        reason: ConnectionReason,
-    ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
-        let server_id = server_id.into();
-        let server_name = server_name.into();
+        let role = role.clone();
         let (event_tx, event_rx) = unbounded_channel();
         let tasks: Arc<Mutex<HashMap<String, ManagedClient>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -215,11 +165,8 @@ impl ClientManager {
                                     *existing = spawn_supervisor(
                                         fullname.clone(),
                                         url,
-                                        server_id.clone(),
-                                        server_name.clone(),
-                                        Arc::clone(&clock),
+                                        role.clone(),
                                         event_tx.clone(),
-                                        reason.clone(),
                                     );
                                 }
                             }
@@ -227,11 +174,8 @@ impl ClientManager {
                                 let managed = spawn_supervisor(
                                     fullname.clone(),
                                     url,
-                                    server_id.clone(),
-                                    server_name.clone(),
-                                    Arc::clone(&clock),
+                                    role.clone(),
                                     event_tx.clone(),
-                                    reason.clone(),
                                 );
                                 tasks.insert(fullname, managed);
                             }
@@ -264,6 +208,38 @@ impl ClientManager {
             event_rx,
         ))
     }
+
+    /// Stop supervising one client and end its reconnect loop, gracefully — a live
+    /// connection emits [`ClientEvent::Disconnected`] as it goes.
+    ///
+    /// This is the counterpart to the manager's deliberate refusal to give up on a
+    /// device whose mDNS record merely lapsed: because a missed announcement is not
+    /// evidence a device left, deciding it *has* left is the caller's call, and this
+    /// is how they say so. Without it an embedder must drop and rebuild the whole
+    /// manager — every other device's connection included — to stop supervising one.
+    ///
+    /// Returns whether that client was being supervised.
+    pub fn stop_client(&self, fullname: &str) -> bool {
+        match self.tasks().remove(fullname) {
+            Some(managed) => {
+                log::info!("[{fullname}] supervision stopped by the caller");
+                let _ = managed.directive_tx.send(Directive::Stop);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// mDNS instance full names of every client currently supervised.
+    pub fn supervised(&self) -> Vec<String> {
+        self.tasks().keys().cloned().collect()
+    }
+
+    fn tasks(&self) -> std::sync::MutexGuard<'_, HashMap<String, ManagedClient>> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl Drop for ClientManager {
@@ -278,22 +254,11 @@ impl Drop for ClientManager {
 fn spawn_supervisor(
     fullname: String,
     url: String,
-    server_id: String,
-    server_name: String,
-    clock: Arc<dyn Clock>,
+    role: ServerRole,
     event_tx: UnboundedSender<ClientEvent>,
-    reason: ConnectionReason,
 ) -> ManagedClient {
     let (directive_tx, directive_rx) = watch::channel(Directive::Dial(url.clone()));
-    let handle = tokio::spawn(supervise(
-        fullname,
-        directive_rx,
-        server_id,
-        server_name,
-        clock,
-        event_tx,
-        reason,
-    ));
+    let handle = tokio::spawn(supervise(fullname, directive_rx, role, event_tx));
     ManagedClient {
         handle,
         directive_tx,
@@ -308,11 +273,8 @@ fn spawn_supervisor(
 async fn supervise(
     fullname: String,
     mut directive_rx: watch::Receiver<Directive>,
-    server_id: String,
-    server_name: String,
-    clock: Arc<dyn Clock>,
+    role: ServerRole,
     event_tx: UnboundedSender<ClientEvent>,
-    reason: ConnectionReason,
 ) {
     let mut backoff = MIN_BACKOFF;
     loop {
@@ -321,15 +283,10 @@ async fn supervise(
             Directive::Stop => return,
         };
 
-        match dial_client_with_reason(
-            &url,
-            &server_id,
-            &server_name,
-            Arc::clone(&clock),
-            reason.clone(),
-        )
-        .await
-        {
+        // Dialing is not selected against `directive_rx` because it is bounded:
+        // the handshake has its own deadline, so a silent peer can delay this loop
+        // by at most that, not indefinitely.
+        match role.dial(&url).await {
             Ok(conn) => {
                 // A Stop that arrived during the dial: don't announce a
                 // connection we're about to tear down.

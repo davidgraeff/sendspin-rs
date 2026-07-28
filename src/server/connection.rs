@@ -3,44 +3,57 @@
 
 use crate::error::Error;
 use crate::protocol::messages::{
-    ClientHello, ConnectionReason, Message, PlayerCommand, ServerCommand, ServerHello, ServerTime,
-    StreamClear, StreamEnd, StreamPlayerConfig, StreamStart,
+    ClientHello, ConnectionReason, Message, PlayerCommand, ServerCommand, ServerHello, StreamClear,
+    StreamEnd, StreamPlayerConfig, StreamStart,
 };
-use crate::server::binary::encode_audio_frame;
+use crate::server::binary::{encode_audio_frame, AudioFrame};
+use crate::server::writer::{
+    write_frame, writer_task, AudioCommand, AudioOrdering, ControlCommand, TimeRequest,
+    MAX_QUEUED_AUDIO_FRAMES, MIN_TIME_REPLY_INTERVAL_US,
+};
 use crate::sync::raw_clock::Clock;
 use futures_util::{
     stream::{SplitSink, SplitStream},
-    SinkExt, StreamExt,
+    StreamExt,
 };
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
-use tokio_tungstenite::{
-    tungstenite::{Bytes, Message as WsMessage},
-    WebSocketStream,
-};
+use tokio_tungstenite::{tungstenite::Message as WsMessage, WebSocketStream};
 
 /// The only role this server negotiates in v1. See the crate-level server
 /// docs for the list of roles deferred for a later contribution
 /// (color/visualizer/artwork/controller/metadata).
 const PLAYER_ROLE: &str = "player@v1";
 
-/// Maximum audio frames a single connection may have queued but not yet
-/// written before [`ServerSender::enqueue_audio`] starts dropping frames. This
-/// bounds memory for a slow or stalled member so it can't back up the whole
-/// process — its own audio suffers, nobody else's does.
-const MAX_QUEUED_AUDIO_FRAMES: usize = 32;
+/// Outcome of a non-blocking [`ServerSender::queue_audio`].
+///
+/// Three states rather than `Result<_, Error>` because all three are ordinary
+/// outcomes the caller must distinguish, and none is *its* failure: a dead member
+/// is not the pusher's error to propagate, and the error it would carry has one
+/// producer and no detail.
+#[must_use = "the caller must handle a dropped frame and a dead connection"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioEnqueue {
+    /// Queued for the writer task. Not yet on the wire — see
+    /// [`ServerSender::send_audio_chunk`] if you need to know that.
+    Queued,
+    /// The connection's audio backlog was at capacity, so this frame was dropped.
+    /// The newest frame is the one discarded; the connection is healthy.
+    Dropped,
+    /// The writer task is gone. Stop pushing to this member and prune it.
+    Disconnected,
+}
 
-/// Minimum spacing between `server/time` replies. The spec's cadence is about
-/// one `client/time` per second; a peer that asks far faster gains nothing (each
-/// reply supersedes the last) and would otherwise convert its own send rate into
-/// server work. Requests arriving inside this window are answered by the reply
-/// already pending rather than queueing another.
-const MIN_TIME_REPLY_INTERVAL_US: i64 = 50_000;
+/// The error every `ServerSender` path reports once its writer task is gone. It
+/// carries no detail because there is none to carry: the connection is over, and
+/// the caller's only useful response is to stop using it.
+pub(super) fn connection_closed() -> Error {
+    Error::WebSocket("connection closed".to_string())
+}
 
 /// Default deadline for the inbound handshake — `client/hello` must arrive, and
 /// `server/hello` must be written, within this.
@@ -52,323 +65,6 @@ const MIN_TIME_REPLY_INTERVAL_US: i64 = 50_000;
 /// dial side it parks a [`crate::server::ClientManager`] supervisor with no
 /// backoff progression and no way to redirect it.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Default deadline for a single WebSocket write before the connection is
-/// declared dead (override with [`crate::server::ServerListener::write_timeout`]).
-///
-/// A member whose socket stops draining — a client that dropped off the WiFi
-/// while holding the TCP connection open, so the kernel send buffer fills and
-/// never empties — must not park the writer task forever. The writer is the
-/// only thing that touches the socket, so a write that never completes stalls
-/// *everything* behind it: `stream/end`, a volume command, the close handshake.
-/// Every caller awaiting one of those would wait with it. Bounding each write
-/// converts that indefinite hang into a dead connection: the writer exits,
-/// every [`ServerSender`] method starts returning `Err`, and
-/// [`crate::server::Group`] prunes the member. A real client re-dials.
-pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Outcome of a non-blocking [`ServerSender::enqueue_audio`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioEnqueue {
-    /// The frame was queued for the writer task.
-    Sent,
-    /// The connection's audio backlog was at capacity; the frame was dropped.
-    Evicted,
-}
-
-/// What a control frame does about the audio already queued ahead of it.
-///
-/// Control frames are dequeued ahead of audio (that's the whole point of the
-/// separate lane), so each one has to say how it relates to the audio it just
-/// overtook. Getting this wrong is how a client ends up seeing `stream/end`
-/// followed by audio — or, in the other direction, how the tail of a stream gets
-/// truncated.
-///
-/// The `u64` in the ordered variants is the audio sequence number this frame was
-/// queued at: audio below it was pushed earlier, audio at or above it was pushed
-/// later and is always left alone.
-#[derive(Debug, Clone, Copy)]
-enum AudioOrdering {
-    /// Unrelated to the audio stream — write it now and leave the queue alone.
-    /// Player commands (volume, mute, static delay) take effect on arrival, so
-    /// overtaking audio is exactly what's wanted.
-    Independent,
-    /// Write it now and *discard* the audio queued before it. That audio belongs
-    /// to a stream this frame supersedes (`stream/start` after a format change)
-    /// or explicitly invalidates (`stream/clear`), so delivering it afterwards
-    /// would be wrong, not merely late.
-    Supersede(u64),
-    /// Write the audio queued before it *first*, then the frame itself.
-    /// `stream/end` logically follows everything already pushed, so overtaking
-    /// it would truncate the tail of the stream. The flush shares a single
-    /// write-timeout budget with the frame it precedes — per-frame deadlines
-    /// would let a merely-slow member hold `stream/end` for backlog × timeout —
-    /// so once that budget is spent the remaining tail is dropped.
-    Flush(u64),
-}
-
-/// A control-plane command for the writer task.
-///
-/// Control travels on its own channel and is dequeued ahead of queued audio (see
-/// [`writer_task`]), so a backlog of audio for a slow member can't delay a
-/// player command or the close handshake — and, together with [`AudioOrdering`],
-/// can't reorder a stream lifecycle transition against the audio around it
-/// either.
-enum ControlCommand {
-    Send {
-        msg: WsMessage,
-        ordering: AudioOrdering,
-        ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
-    },
-    Close {
-        ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
-    },
-}
-
-/// A pending `server/time` echo.
-///
-/// This travels in a single-slot [`watch`] channel rather than a queue, and that
-/// is a correctness property, not an optimisation: the reply is derived purely
-/// from the *latest* request, so a peer that floods `client/time` can only ever
-/// have one outstanding. Queueing one per request instead lets a peer's send rate
-/// dictate the server's memory use and, because control frames are written ahead
-/// of audio, starve the audio lane to a standstill.
-///
-/// `server_transmitted` is stamped by the writer immediately before the frame
-/// reaches the wire, not here — waiting time would otherwise leak into the
-/// client's clock filter as measurement error.
-#[derive(Debug, Clone, Copy)]
-struct TimeRequest {
-    client_transmitted: i64,
-    server_received: i64,
-}
-
-/// One data-plane (audio) frame for the writer task.
-struct AudioCommand {
-    /// Enqueue order within this connection, compared against a control frame's
-    /// `purge_audio_before`.
-    seq: u64,
-    frame: Bytes,
-    /// `Some` only for [`ServerSender::send_audio_chunk`], which awaits its own
-    /// frame. The group broadcast path ([`ServerSender::enqueue_audio`]) is
-    /// fire-and-forget, so broadcasting never blocks on any member's socket.
-    ack: Option<tokio::sync::oneshot::Sender<Result<(), Error>>>,
-}
-
-/// Write one frame, bounded by `write_timeout`.
-///
-/// `SinkExt::send` is not cancel-safe, so timing out can leave the sink
-/// mid-frame — that's acceptable only because the caller treats a timeout as
-/// fatal: the writer loop exits and drops the sink, and nothing else ever
-/// touches it.
-async fn write_frame<S>(
-    sink: &mut SplitSink<WebSocketStream<S>, WsMessage>,
-    msg: WsMessage,
-    write_timeout: Duration,
-) -> Result<(), Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match tokio::time::timeout(write_timeout, sink.send(msg)).await {
-        Ok(result) => result.map_err(|e| Error::WebSocket(e.to_string())),
-        Err(_) => Err(Error::WebSocket(format!(
-            "write stalled for {write_timeout:?}"
-        ))),
-    }
-}
-
-/// Write out every already-queued audio frame with `seq < before`, so a control
-/// frame that logically *follows* that audio ([`AudioOrdering::Flush`]) doesn't
-/// overtake it.
-///
-/// Only frames already sitting in `audio_rx` are flushed, which is exactly the
-/// right set: the caller queued this control frame after those audio frames, and
-/// an unbounded channel's `send` completes immediately, so anything below `before`
-/// is already here. (A caller enqueueing audio concurrently from another task
-/// without serializing against the control frame gets best-effort ordering — see
-/// [`QueuedControl`] for how [`crate::server::Group`] serializes the two.)
-///
-/// Bounded by `deadline` **overall**, not per frame. Per-frame deadlines would
-/// make the flush cost backlog × write_timeout — a member slow enough to keep
-/// succeeding could hold `stream/end` (and the close behind it) for minutes. Past
-/// the deadline the remaining tail is dropped, which is the right trade: the tail
-/// of an ending stream is worth less than the connection.
-///
-/// Returns the first write error, leaving the rest un-flushed: the connection is
-/// finished at that point, so there's nothing to salvage.
-async fn flush_audio_before<S>(
-    sink: &mut SplitSink<WebSocketStream<S>, WsMessage>,
-    audio_rx: &mut UnboundedReceiver<AudioCommand>,
-    audio_queued: &AtomicUsize,
-    before: u64,
-    drop_audio_before: u64,
-    deadline: Instant,
-) -> Result<(), Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    while let Ok(audio) = audio_rx.try_recv() {
-        // A frame at or above the marker was pushed after this control frame was
-        // queued, so it isn't ours to flush — but it's already out of the channel
-        // and re-queueing it would put it behind whatever arrived since, so write
-        // it and stop. That also bounds the flush against a task that keeps
-        // pushing audio concurrently.
-        let reached_marker = audio.seq >= before;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let result = if audio.seq < drop_audio_before || remaining.is_zero() {
-            // Superseded by an earlier transition that already went out, or the
-            // flush budget is spent and the tail is being dropped.
-            Ok(())
-        } else {
-            write_frame(sink, WsMessage::Binary(audio.frame), remaining).await
-        };
-        audio_queued.fetch_sub(1, Ordering::Relaxed);
-        match result {
-            Ok(()) => {
-                if let Some(ack) = audio.ack {
-                    let _ = ack.send(Ok(()));
-                }
-            }
-            Err(e) => {
-                // Report the flush failure as its own thing: the caller is awaiting
-                // a lifecycle frame and would otherwise be told its own write
-                // stalled, with the error text wrapped twice.
-                let propagated = Error::WebSocket(format!(
-                    "audio flush before a stream transition failed: {e}"
-                ));
-                if let Some(ack) = audio.ack {
-                    let _ = ack.send(Err(e));
-                }
-                return Err(propagated);
-            }
-        }
-        if reached_marker {
-            break;
-        }
-    }
-    Ok(())
-}
-
-async fn writer_task<S>(
-    mut sink: SplitSink<WebSocketStream<S>, WsMessage>,
-    mut ctrl_rx: UnboundedReceiver<ControlCommand>,
-    mut time_rx: watch::Receiver<Option<TimeRequest>>,
-    mut audio_rx: UnboundedReceiver<AudioCommand>,
-    clock: Arc<dyn Clock>,
-    audio_queued: Arc<AtomicUsize>,
-    write_timeout: Duration,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    // Audio whose sequence number is below this was enqueued before a lifecycle
-    // transition that has already been written, so writing it now would put it
-    // on the wrong side of that transition. See `purge_audio_before`.
-    let mut drop_audio_before: u64 = 0;
-
-    loop {
-        // `biased` makes this a strict priority rather than a random choice:
-        // whenever a control frame is queued it is taken first, so queued audio
-        // can never delay one. The time lane sits between the two: it is
-        // single-slot, so it can hold at most one frame's worth of priority over
-        // audio no matter how fast a peer asks.
-        tokio::select! {
-            biased;
-            Some(cmd) = ctrl_rx.recv() => {
-                match cmd {
-                    ControlCommand::Send { msg, ordering, ack } => {
-                        let result = match ordering {
-                            AudioOrdering::Independent => {
-                                write_frame(&mut sink, msg, write_timeout).await
-                            }
-                            AudioOrdering::Supersede(seq) => {
-                                drop_audio_before = drop_audio_before.max(seq);
-                                write_frame(&mut sink, msg, write_timeout).await
-                            }
-                            AudioOrdering::Flush(seq) => {
-                                // One budget covers the flushed tail *and* the frame
-                                // itself, so the whole operation stays inside two
-                                // write timeouts however deep the backlog is.
-                                let deadline = Instant::now() + write_timeout;
-                                match flush_audio_before(
-                                    &mut sink,
-                                    &mut audio_rx,
-                                    &audio_queued,
-                                    seq,
-                                    drop_audio_before,
-                                    deadline,
-                                )
-                                .await
-                                {
-                                    Ok(()) => write_frame(&mut sink, msg, write_timeout).await,
-                                    Err(e) => Err(e),
-                                }
-                            }
-                        };
-                        let failed = result.is_err();
-                        log::debug!("Wrote control frame: ok={}", !failed);
-                        // Ignore SendError: the caller may have dropped its receiver.
-                        let _ = ack.send(result);
-                        if failed {
-                            break;
-                        }
-                    }
-                    ControlCommand::Close { ack } => {
-                        // No purge watermark needed: the loop exits below, so
-                        // nothing queued behind a close is ever written.
-                        let result = match tokio::time::timeout(write_timeout, sink.close()).await {
-                            Ok(result) => result.map_err(|e| Error::WebSocket(e.to_string())),
-                            Err(_) => Err(Error::WebSocket(format!(
-                                "close stalled for {write_timeout:?}"
-                            ))),
-                        };
-                        let _ = ack.send(result);
-                        break;
-                    }
-                }
-            }
-            Ok(()) = time_rx.changed() => {
-                // Stamp `server_transmitted` here, immediately before the write, so
-                // however long this reply waited behind other frames does not leak
-                // into the client's clock filter as measurement error.
-                let Some(req) = *time_rx.borrow_and_update() else {
-                    continue;
-                };
-                let reply = Message::ServerTime(ServerTime {
-                    client_transmitted: req.client_transmitted,
-                    server_received: req.server_received,
-                    server_transmitted: clock.now_micros(),
-                });
-                let result = match serde_json::to_string(&reply) {
-                    Ok(json) => {
-                        write_frame(&mut sink, WsMessage::Text(json.into()), write_timeout).await
-                    }
-                    Err(e) => Err(Error::Protocol(e.to_string())),
-                };
-                if result.is_err() {
-                    break;
-                }
-            }
-            Some(audio) = audio_rx.recv() => {
-                let result = if audio.seq < drop_audio_before {
-                    log::trace!("dropping audio frame superseded by a stream lifecycle transition");
-                    Ok(())
-                } else {
-                    write_frame(&mut sink, WsMessage::Binary(audio.frame), write_timeout).await
-                };
-                audio_queued.fetch_sub(1, Ordering::Relaxed);
-                let failed = result.is_err();
-                if let Some(ack) = audio.ack {
-                    let _ = ack.send(result);
-                }
-                if failed {
-                    break;
-                }
-            }
-            else => break,
-        }
-    }
-    log::debug!("Server connection writer task exiting");
-}
 
 /// A control frame that has been *placed in* a connection's write queue, but
 /// not yet written.
@@ -385,19 +81,29 @@ pub struct QueuedControl {
     result: Result<tokio::sync::oneshot::Receiver<Result<(), Error>>, Error>,
 }
 
+impl std::future::IntoFuture for QueuedControl {
+    type Output = Result<(), Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+
+    /// So a caller that just wants the frame written can `.await` the queue call
+    /// directly — `sender.queue_player_command(cmd).await?` — while one that needs
+    /// to fix frame order under a lock still queues first and awaits later.
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.written())
+    }
+}
+
 impl QueuedControl {
     /// Wait for this frame to reach the socket.
     ///
-    /// Bounded by the connection's write timeout (see [`DEFAULT_WRITE_TIMEOUT`])
+    /// Bounded by the connection's write timeout (see [`crate::server::DEFAULT_WRITE_TIMEOUT`])
     /// plus whatever control frames were already queued ahead of it. A
     /// `stream/end` additionally waits for the audio pushed before it, but that
     /// flush shares one write-timeout budget with the frame itself, so the total
     /// stays within two write timeouts regardless of backlog depth.
     pub async fn written(self) -> Result<(), Error> {
         match self.result {
-            Ok(ack) => ack
-                .await
-                .map_err(|_| Error::WebSocket("connection closed".to_string()))?,
+            Ok(ack) => ack.await.map_err(|_| connection_closed())?,
             Err(e) => Err(e),
         }
     }
@@ -414,16 +120,13 @@ pub struct ServerSender {
 }
 
 impl ServerSender {
-    /// Enqueue one pre-encoded audio frame without waiting for it to reach the
-    /// wire — a group broadcast calls this on every member, so it must never
-    /// block on any one member's socket. `frame` is a [`Bytes`], so fanning the
-    /// same frame out to N members is N cheap refcount clones, not N copies.
+    /// Queue one framed audio chunk without waiting for it to reach the wire — a
+    /// group broadcast calls this on every member, so it must never block on any
+    /// one member's socket. Cloning an [`AudioFrame`] is a refcount bump, so fanning
+    /// one chunk out to N members is N cheap clones, not N copies.
     ///
-    /// Returns [`AudioEnqueue::Evicted`] if this connection's audio backlog is
-    /// already full (a slow/stalled member), dropping the frame rather than
-    /// growing memory without bound. `Err` means the writer task is gone (the
-    /// member is dead) and the caller should stop broadcasting to it.
-    pub fn enqueue_audio(&self, frame: Bytes) -> Result<AudioEnqueue, Error> {
+    /// See [`AudioEnqueue`] for the three outcomes.
+    pub fn queue_audio(&self, frame: AudioFrame) -> AudioEnqueue {
         // Liveness is checked before the backlog, and must stay that way. The
         // counter is only decremented by the writer, so frames still queued when
         // the writer exits are never accounted for — leaving the counter at or
@@ -431,22 +134,22 @@ impl ServerSender {
         // first would then report `Evicted` forever and the caller would never
         // learn to prune the member.
         if self.audio_tx.is_closed() {
-            return Err(Error::WebSocket("connection closed".to_string()));
+            return AudioEnqueue::Disconnected;
         }
         if self.audio_queued.load(Ordering::Relaxed) >= MAX_QUEUED_AUDIO_FRAMES {
-            return Ok(AudioEnqueue::Evicted);
+            return AudioEnqueue::Dropped;
         }
         self.audio_queued.fetch_add(1, Ordering::Relaxed);
         let cmd = AudioCommand {
             seq: self.next_audio_seq(),
-            frame,
+            frame: frame.0,
             ack: None,
         };
         match self.audio_tx.send(cmd) {
-            Ok(()) => Ok(AudioEnqueue::Sent),
+            Ok(()) => AudioEnqueue::Queued,
             Err(_) => {
                 self.audio_queued.fetch_sub(1, Ordering::Relaxed);
-                Err(Error::WebSocket("connection closed".to_string()))
+                AudioEnqueue::Disconnected
             }
         }
     }
@@ -494,7 +197,7 @@ impl ServerSender {
         QueuedControl {
             result: match self.ctrl_tx.send(cmd) {
                 Ok(()) => Ok(ack_rx),
-                Err(_) => Err(Error::WebSocket("connection closed".to_string())),
+                Err(_) => Err(connection_closed()),
             },
         }
     }
@@ -550,18 +253,12 @@ impl ServerSender {
         )
     }
 
-    /// Announce the start of a player audio stream. Send this once before
-    /// the first [`Self::send_audio_chunk`].
-    pub async fn send_stream_start(&self, player: StreamPlayerConfig) -> Result<(), Error> {
-        self.queue_stream_start(player).written().await
-    }
-
     /// Push one player audio chunk. `timestamp_us` is the intended playback
     /// time in this server's clock domain (see [`crate::sync::raw_clock::Clock`]);
     /// the client converts it to its own domain using the offset/drift it
     /// tracks from `server/time` replies.
     ///
-    /// Travels the same data-plane queue as [`Self::enqueue_audio`], so mixing
+    /// Travels the same data-plane queue as [`Self::queue_audio`], so mixing
     /// the two keeps audio in push order; awaiting the write is the only
     /// difference.
     pub async fn send_audio_chunk(&self, timestamp_us: i64, payload: &[u8]) -> Result<(), Error> {
@@ -570,37 +267,20 @@ impl ServerSender {
         self.audio_queued.fetch_add(1, Ordering::Relaxed);
         let cmd = AudioCommand {
             seq: self.next_audio_seq(),
-            frame: frame.into(),
+            frame: frame.0,
             ack: Some(ack_tx),
         };
         if self.audio_tx.send(cmd).is_err() {
             self.audio_queued.fetch_sub(1, Ordering::Relaxed);
-            return Err(Error::WebSocket("connection closed".to_string()));
+            return Err(connection_closed());
         }
-        ack_rx
-            .await
-            .map_err(|_| Error::WebSocket("connection closed".to_string()))?
-    }
-
-    /// End the player audio stream.
-    pub async fn send_stream_end(&self) -> Result<(), Error> {
-        self.queue_stream_end().written().await
-    }
-
-    /// Ask the client to discard any buffered-but-unplayed audio (e.g. after
-    /// a seek), without ending the stream.
-    pub async fn send_stream_clear(&self) -> Result<(), Error> {
-        self.queue_stream_clear().written().await
-    }
-
-    /// Send a player command (volume, mute, static delay) to the client.
-    pub async fn send_player_command(&self, command: PlayerCommand) -> Result<(), Error> {
-        self.queue_player_command(command).written().await
+        ack_rx.await.map_err(|_| connection_closed())?
     }
 }
 
 /// Aborts background tasks on drop. Hold this alive for the lifetime of the
 /// connection — mirrors [`crate::protocol::client::ConnectionGuard`].
+#[derive(Debug)]
 pub struct ServerConnectionGuard {
     sender: ServerSender,
     router_handle: Option<tokio::task::JoinHandle<()>>,
@@ -619,7 +299,7 @@ impl ServerConnectionGuard {
     /// this returns even against a socket that has stopped draining entirely.
     ///
     /// Audio still queued when the close is processed is **discarded**: nothing
-    /// behind a close is written. Call [`ServerSender::send_stream_end`] first if
+    /// behind a close is written. Call [`ServerSender::queue_stream_end`] first if
     /// the tail of the stream matters.
     pub async fn disconnect(mut self) -> Result<(), Error> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -627,11 +307,9 @@ impl ServerConnectionGuard {
             .sender
             .ctrl_tx
             .send(ControlCommand::Close { ack: ack_tx })
-            .map_err(|_| Error::WebSocket("connection closed".to_string()));
+            .map_err(|_| connection_closed());
         let result = match close_result {
-            Ok(()) => ack_rx
-                .await
-                .map_err(|_| Error::WebSocket("connection closed".to_string()))?,
+            Ok(()) => ack_rx.await.map_err(|_| connection_closed())?,
             Err(e) => Err(e),
         };
         if let Some(h) = self.writer_handle.take() {
@@ -655,8 +333,24 @@ impl Drop for ServerConnectionGuard {
     }
 }
 
+/// The parts of a [`ServerConnection`], from [`ServerConnection::split`].
+#[derive(Debug)]
+pub struct ServerConnectionParts {
+    /// The client's `client/hello` payload.
+    pub hello: ClientHello,
+    /// Roles this server granted this client.
+    pub active_roles: Vec<String>,
+    /// `client/state`, `client/command` and `client/goodbye`, as received.
+    pub messages: UnboundedReceiver<Message>,
+    /// Handle for pushing stream control and audio to this client.
+    pub sender: ServerSender,
+    /// Keeps the connection alive; dropping it tears the connection down.
+    pub guard: ServerConnectionGuard,
+}
+
 /// A single accepted client, past the handshake. Returned by
 /// [`crate::server::ServerListener::accept`].
+#[derive(Debug)]
 pub struct ServerConnection {
     /// The client's `client/hello` payload — identity, declared capabilities,
     /// device info. Kept in full so callers can read `player@v1_support`
@@ -707,9 +401,25 @@ impl ServerConnection {
         self.guard.disconnect().await
     }
 
+    /// Split into its parts, so the message loop can be driven by one task while
+    /// another holds the sender and the guard.
+    ///
+    /// This is the counterpart to [`crate::protocol::client::ProtocolClient::split`]
+    /// on the client role, and the only way to obtain a [`ServerConnectionGuard`]:
+    /// hold it for as long as the connection should live, since dropping it tears
+    /// the connection down.
+    pub fn split(self) -> ServerConnectionParts {
+        ServerConnectionParts {
+            hello: self.hello,
+            active_roles: self.active_roles,
+            messages: self.messages,
+            sender: self.sender,
+            guard: self.guard,
+        }
+    }
+
     /// Drive the server-side handshake and message loop over an
-    /// already-handshaked WebSocket stream. Shared by
-    /// [`crate::server::ServerListener::accept`] and tests.
+    /// already-handshaked WebSocket stream.
     pub(crate) async fn drive<S>(
         ws_stream: WebSocketStream<S>,
         server_id: &str,

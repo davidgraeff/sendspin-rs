@@ -19,7 +19,7 @@
 
 use clap::Parser;
 use sendspin::protocol::messages::Message;
-use sendspin::server::{dial_client, Advertisement, ClientEvent, ClientManager, Group};
+use sendspin::server::{Advertisement, ClientEvent, ClientManager, Group, ServerRole};
 use sendspin::{DefaultClock, ServerConnection, ServerListener};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -174,9 +174,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             / (wav.sample_rate as f64 * wav.channels as f64 * (wav.bit_depth as f64 / 8.0))
     );
 
-    let listener = ServerListener::bind(&args.bind, &args.server_id, &args.name)
-        .await?
-        .path(&args.path);
+    // One role, reused for the listener, the dials and the manager, so this tool's
+    // identity and connection settings are stated once.
+    let role =
+        ServerRole::new(&args.server_id, &args.name).clock(Arc::new(DefaultClock::default()));
+    let listener = role.bind(&args.bind).await?.path(&args.path);
     let port = listener.local_addr()?.port();
     println!(
         "listening on {} (path {}), for clients that dial in",
@@ -208,16 +210,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Kept alive for main()'s whole lifetime — dropping it would stop
     // discovery and abort every reconnect loop it's supervising.
     let _manager = if discover {
-        Some(spawn_manager_loop(
-            Arc::clone(&group),
-            args.server_id.clone(),
-            args.name.clone(),
-        )?)
+        Some(spawn_manager_loop(Arc::clone(&group), role.clone())?)
     } else {
         None
     };
     for url in &args.dial_urls {
-        dial_one(&group, url, &args.server_id, &args.name).await;
+        dial_one(&group, url, &role).await;
     }
 
     println!("waiting for at least one client (inbound accept, mDNS discovery, or --dial)...");
@@ -313,11 +311,9 @@ fn spawn_accept_loop(listener: ServerListener, group: Arc<Group>) {
 /// disconnect and re-dials if a device reappears at a new address).
 fn spawn_manager_loop(
     group: Arc<Group>,
-    server_id: String,
-    name: String,
+    role: ServerRole,
 ) -> Result<ClientManager, Box<dyn std::error::Error>> {
-    let (manager, mut events) =
-        ClientManager::start(server_id, name, Arc::new(DefaultClock::default()))?;
+    let (manager, mut events) = ClientManager::start(&role, |_fullname| true, None)?;
     println!("discovering Sendspin clients via mDNS (_sendspin._tcp.local.)...");
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
@@ -364,12 +360,12 @@ fn spawn_manager_loop(
 }
 
 /// Dial one specific URL given via `--dial`, once, at startup.
-async fn dial_one(group: &Arc<Group>, url: &str, server_id: &str, name: &str) {
-    dial_and_add(group, url, server_id, name).await;
+async fn dial_one(group: &Arc<Group>, url: &str, role: &ServerRole) {
+    dial_and_add(group, url, role).await;
 }
 
-async fn dial_and_add(group: &Arc<Group>, url: &str, server_id: &str, name: &str) {
-    match dial_client(url, server_id, name, Arc::new(DefaultClock::default())).await {
+async fn dial_and_add(group: &Arc<Group>, url: &str, role: &ServerRole) {
+    match role.dial(url).await {
         Ok(conn) => {
             println!(
                 "[{url}] client connected (dialed): id={} name={:?} roles={:?}",

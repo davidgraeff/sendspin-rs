@@ -3,13 +3,10 @@
 
 use crate::error::Error;
 use crate::protocol::messages::ConnectionReason;
-use crate::server::connection::{
-    ServerConnection, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
-};
-use crate::sync::raw_clock::{Clock, DefaultClock};
+use crate::server::connection::ServerConnection;
+use crate::server::role::ServerRole;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{lookup_host, TcpListener, TcpSocket, TcpStream, ToSocketAddrs};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -51,32 +48,25 @@ pub(crate) fn transport_config() -> WebSocketConfig {
 /// keep accepting while driving existing ones.
 pub struct ServerListener {
     tcp: TcpListener,
-    server_id: String,
-    server_name: String,
+    role: ServerRole,
     path: Option<String>,
-    clock: Arc<dyn Clock>,
-    write_timeout: Duration,
-    handshake_timeout: Duration,
 }
 
 impl std::fmt::Debug for ServerListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerListener")
             .field("local_addr", &self.tcp.local_addr().ok())
-            .field("server_id", &self.server_id)
+            .field("role", &self.role)
             .field("path", &self.path)
             .finish()
     }
 }
 
 impl ServerListener {
-    /// Bind a listener. `server_id` should be stable across restarts (it's
-    /// how a client recognizes "the same server" across reconnects);
-    /// `server_name` is human-readable and shown to users.
-    pub async fn bind(
+    /// Bind a listener for `role`. Reached through [`ServerRole::bind`].
+    pub(crate) async fn bind_with_role(
+        role: ServerRole,
         addr: impl ToSocketAddrs,
-        server_id: impl Into<String>,
-        server_name: impl Into<String>,
     ) -> Result<Self, Error> {
         // Bind with SO_REUSEADDR so a port freed by a just-torn-down server can
         // be reused immediately — otherwise recreating a group on the same port
@@ -103,13 +93,15 @@ impl ServerListener {
             .map_err(|e| Error::Connection(format!("listen failed: {e}")))?;
         Ok(Self {
             tcp,
-            server_id: server_id.into(),
-            server_name: server_name.into(),
+            role,
             path: None,
-            clock: Arc::new(DefaultClock::default()),
-            write_timeout: DEFAULT_WRITE_TIMEOUT,
-            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         })
+    }
+
+    /// The identity and connection settings every peer accepted here is driven
+    /// with.
+    pub fn role(&self) -> &ServerRole {
+        &self.role
     }
 
     /// Restrict accepted connections to a specific HTTP path (the Sendspin
@@ -126,34 +118,6 @@ impl ServerListener {
         self
     }
 
-    /// Use a custom clock instead of [`DefaultClock`] — mainly for tests that
-    /// need deterministic or synchronized-with-a-peer timestamps.
-    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
-        self
-    }
-
-    /// Deadline for a single WebSocket write to a connected client before that
-    /// connection is declared dead. Defaults to
-    /// [`crate::server::DEFAULT_WRITE_TIMEOUT`]; see its docs for why the bound
-    /// matters. Lower it for tests that deliberately stall a socket.
-    pub fn write_timeout(mut self, write_timeout: Duration) -> Self {
-        self.write_timeout = write_timeout;
-        self
-    }
-
-    /// Deadline for an accepted peer to complete the handshake — `client/hello`
-    /// received and `server/hello` written. Defaults to
-    /// [`crate::server::DEFAULT_HANDSHAKE_TIMEOUT`].
-    ///
-    /// This is what stops one peer holding the accept loop: [`Self::accept`]
-    /// drives the handshake inline, so without a bound a peer that connects and
-    /// then stalls blocks every subsequent inbound connection.
-    pub fn handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
-        self.handshake_timeout = handshake_timeout;
-        self
-    }
-
     /// Accept the next inbound connection, returning the driven
     /// [`ServerConnection`] and the peer's address.
     ///
@@ -162,7 +126,7 @@ impl ServerListener {
     ///
     /// Not cancel-safe: dropping the returned future mid-handshake tears down
     /// that connection. A peer that connects and then stalls the handshake fails
-    /// after [`Self::handshake_timeout`] rather than blocking this future — which
+    /// after [`ServerRole::handshake_timeout`] rather than blocking this future — which
     /// matters because the handshake is driven inline, so an unbounded one would
     /// hold up every subsequent inbound connection.
     pub async fn accept(&self) -> Result<(ServerConnection, SocketAddr), Error> {
@@ -188,12 +152,12 @@ impl ServerListener {
         // simply present/available — announce Discovery rather than Playback.
         ServerConnection::drive(
             ws,
-            &self.server_id,
-            &self.server_name,
+            &self.role.server_id,
+            &self.role.server_name,
             ConnectionReason::Discovery,
-            Arc::clone(&self.clock),
-            self.write_timeout,
-            self.handshake_timeout,
+            Arc::clone(&self.role.clock),
+            self.role.write_timeout,
+            self.role.handshake_timeout,
         )
         .await
     }
