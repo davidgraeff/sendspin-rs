@@ -33,7 +33,11 @@ enum Directive {
     /// (Re)dial the client at this URL. A new URL for an already-connected
     /// client makes the supervisor drop the current connection and redial.
     Dial(String),
-    /// Stop supervising — the device's mDNS advertisement was removed.
+    /// Stop supervising this client and end its task. Nothing sends this today,
+    /// because an mDNS removal is a possible power-save lapse rather than proof
+    /// of departure (see `Discovered::Removed`); `supervise` honours it so that
+    /// an explicit "stop supervising this device" needs no new plumbing.
+    #[allow(dead_code)]
     Stop,
 }
 
@@ -195,13 +199,19 @@ impl ClientManager {
                             }
                         }
                     }
-                    // The device's advertisement went away: stop supervising it
-                    // (gracefully, so a live connection emits Disconnected)
-                    // instead of redialing a gone device forever.
+                    // The device's mDNS advertisement went away. This is NOT proof
+                    // the device left: WiFi power-saving speakers (e.g. Home Assistant
+                    // Voice PE) routinely let their record lapse (TTL expiry) while
+                    // still online, then re-announce. Stopping supervision here would let
+                    // a brief mDNS flap silence the device permanently — nothing would
+                    // redial it. So KEEP the supervisor: its dial loop already retries
+                    // with backoff (1s→5min), so it reconnects the moment the device is
+                    // reachable again, no dependency on a fresh mDNS announcement. A
+                    // genuinely-gone device is removed by the host's own liveness layer
+                    // (which restarts this manager without it) — not by an mDNS flap.
                     Discovered::Removed { fullname } => {
-                        if let Some(managed) = tasks_for_browse.lock().unwrap().remove(&fullname) {
-                            log::info!("[{fullname}] mDNS service removed, stopping supervision");
-                            let _ = managed.directive_tx.send(Directive::Stop);
+                        if tasks_for_browse.lock().unwrap().contains_key(&fullname) {
+                            log::info!("[{fullname}] mDNS service removed — keeping supervision (dial loop retries; likely a power-save/TTL flap)");
                         }
                     }
                 }
