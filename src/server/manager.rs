@@ -103,7 +103,13 @@ struct ManagedClient {
 /// is dropped.
 pub struct ClientManager {
     tasks: Arc<Mutex<HashMap<String, ManagedClient>>>,
-    browse_handle: JoinHandle<()>,
+    /// `None` for a manager started with [`ClientManager::start_without_discovery`],
+    /// which has no browser of its own.
+    browse_handle: Option<JoinHandle<()>>,
+    /// Kept so [`ClientManager::supervise`] can spawn supervisors with the same
+    /// identity/timeouts/connection-reason the manager was started with.
+    role: ServerRole,
+    event_tx: UnboundedSender<ClientEvent>,
 }
 
 impl ClientManager {
@@ -126,8 +132,12 @@ impl ClientManager {
         allow: impl Fn(&str) -> bool + Send + 'static,
         daemon: Option<ServiceDaemon>,
     ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
+        // Two clones survive the browse task: the manager keeps them so
+        // `supervise` can spawn supervisors with the same identity later.
+        let role_for_manager = role.clone();
         let role = role.clone();
         let (event_tx, event_rx) = unbounded_channel();
+        let event_tx_for_manager = event_tx.clone();
         let tasks: Arc<Mutex<HashMap<String, ManagedClient>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -203,10 +213,84 @@ impl ClientManager {
         Ok((
             Self {
                 tasks,
-                browse_handle,
+                browse_handle: Some(browse_handle),
+                role: role_for_manager,
+                event_tx: event_tx_for_manager,
             },
             event_rx,
         ))
+    }
+
+    /// Start a manager that does **no discovery of its own**: the caller supplies
+    /// which clients to keep connected, with [`Self::supervise`].
+    ///
+    /// Use this when the embedder already browses `_sendspin._tcp` itself, and
+    /// especially when it runs **several** managers over one shared
+    /// [`ClientBrowser::with_daemon`] daemon — because mdns-sd keeps exactly one
+    /// listener per service type ("If there is already a `listener`, it will be
+    /// updated, i.e. overwritten"), so every manager that browses steals the
+    /// subscription from the one before it. All but the newest then go deaf: they
+    /// never see their devices and never dial, silently. One browse in the embedder,
+    /// feeding N caller-driven managers, has no such failure mode — and costs one
+    /// less multicast querier per manager.
+    ///
+    /// Everything after the dial is unchanged: the same supervisor loop, the same
+    /// `Connected`/`Message`/`Disconnected` events, the same capped-backoff retry.
+    pub fn start_without_discovery(role: &ServerRole) -> (Self, UnboundedReceiver<ClientEvent>) {
+        let (event_tx, event_rx) = unbounded_channel();
+        (
+            Self {
+                tasks: Arc::new(Mutex::new(HashMap::new())),
+                browse_handle: None,
+                role: role.clone(),
+                event_tx,
+            },
+            event_rx,
+        )
+    }
+
+    /// Keep the client at `url` connected, dialing it now and retrying with capped
+    /// backoff for as long as this manager lives (or until
+    /// [`Self::stop_client`]).
+    ///
+    /// Idempotent per `fullname`, which is what makes it safe to call on every pass
+    /// of an embedder's own reconcile loop: an unchanged URL is a no-op, a changed
+    /// one redirects the running supervisor (it closes the current connection, emits
+    /// [`ClientEvent::Disconnected`], and redials the new address) exactly as a
+    /// re-resolve through the browser would.
+    pub fn supervise(&self, fullname: &str, url: &str) {
+        let mut tasks = self.tasks();
+        match tasks.get_mut(fullname) {
+            Some(existing) if existing.url == url => {}
+            Some(existing) => {
+                log::info!(
+                    "[{fullname}] address changed ({} -> {url}), reconnecting",
+                    existing.url
+                );
+                existing.url = url.to_string();
+                if existing
+                    .directive_tx
+                    .send(Directive::Dial(url.to_string()))
+                    .is_err()
+                {
+                    *existing = spawn_supervisor(
+                        fullname.to_string(),
+                        url.to_string(),
+                        self.role.clone(),
+                        self.event_tx.clone(),
+                    );
+                }
+            }
+            None => {
+                let managed = spawn_supervisor(
+                    fullname.to_string(),
+                    url.to_string(),
+                    self.role.clone(),
+                    self.event_tx.clone(),
+                );
+                tasks.insert(fullname.to_string(), managed);
+            }
+        }
     }
 
     /// Stop supervising one client and end its reconnect loop, gracefully — a live
@@ -244,7 +328,9 @@ impl ClientManager {
 
 impl Drop for ClientManager {
     fn drop(&mut self) {
-        self.browse_handle.abort();
+        if let Some(h) = &self.browse_handle {
+            h.abort();
+        }
         for (_, managed) in self.tasks.lock().unwrap().drain() {
             managed.handle.abort();
         }
