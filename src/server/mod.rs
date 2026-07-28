@@ -41,7 +41,7 @@ pub use connection::{
     AudioEnqueue, QueuedControl, ServerConnection, ServerConnectionGuard, ServerSender,
     DEFAULT_WRITE_TIMEOUT,
 };
-pub use dial::{dial_client, dial_client_with_write_timeout};
+pub use dial::{dial_client, dial_client_with_reason, dial_client_with_write_timeout};
 pub use discovery::{Advertisement, ClientBrowser, Discovered};
 pub use group::{Group, DEFAULT_SEND_AHEAD_US};
 pub use listener::ServerListener;

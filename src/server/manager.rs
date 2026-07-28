@@ -1,9 +1,9 @@
 // ABOUTME: Continuous discovery + reconnect-with-backoff supervision for clients
 // ABOUTME: that only run their own embedded server (the supervised form of dial_client)
 
-use crate::protocol::messages::Message;
+use crate::protocol::messages::{ConnectionReason, Message};
 use crate::server::connection::{ServerConnection, ServerSender};
-use crate::server::dial::dial_client;
+use crate::server::dial::dial_client_with_reason;
 use crate::server::discovery::{ClientBrowser, Discovered};
 use crate::sync::raw_clock::Clock;
 use mdns_sd::ServiceDaemon;
@@ -139,6 +139,33 @@ impl ClientManager {
         allow: impl Fn(&str) -> bool + Send + 'static,
         daemon: Option<ServiceDaemon>,
     ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
+        Self::start_filtered_with_daemon_reason(
+            server_id,
+            server_name,
+            clock,
+            allow,
+            daemon,
+            ConnectionReason::Playback,
+        )
+    }
+
+    /// Like [`Self::start_filtered_with_daemon`], but every dial announces
+    /// `reason` instead of [`ConnectionReason::Playback`].
+    ///
+    /// Pass [`ConnectionReason::Discovery`] for a manager that keeps devices
+    /// connected merely to **be ready** (announcements, control commands) rather
+    /// than to stream: the client's keep-or-switch policy weighs this, so a
+    /// be-ready manager that claimed Playback could stop the device from switching
+    /// to a server the user actually asked to play. See
+    /// [`crate::server::dial_client_with_reason`].
+    pub fn start_filtered_with_daemon_reason(
+        server_id: impl Into<String>,
+        server_name: impl Into<String>,
+        clock: Arc<dyn Clock>,
+        allow: impl Fn(&str) -> bool + Send + 'static,
+        daemon: Option<ServiceDaemon>,
+        reason: ConnectionReason,
+    ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
         let server_id = server_id.into();
         let server_name = server_name.into();
         let (event_tx, event_rx) = unbounded_channel();
@@ -183,6 +210,7 @@ impl ClientManager {
                                         server_name.clone(),
                                         Arc::clone(&clock),
                                         event_tx.clone(),
+                                        reason.clone(),
                                     );
                                 }
                             }
@@ -194,6 +222,7 @@ impl ClientManager {
                                     server_name.clone(),
                                     Arc::clone(&clock),
                                     event_tx.clone(),
+                                    reason.clone(),
                                 );
                                 tasks.insert(fullname, managed);
                             }
@@ -244,6 +273,7 @@ fn spawn_supervisor(
     server_name: String,
     clock: Arc<dyn Clock>,
     event_tx: UnboundedSender<ClientEvent>,
+    reason: ConnectionReason,
 ) -> ManagedClient {
     let (directive_tx, directive_rx) = watch::channel(Directive::Dial(url.clone()));
     let handle = tokio::spawn(supervise(
@@ -253,6 +283,7 @@ fn spawn_supervisor(
         server_name,
         clock,
         event_tx,
+        reason,
     ));
     ManagedClient {
         handle,
@@ -272,6 +303,7 @@ async fn supervise(
     server_name: String,
     clock: Arc<dyn Clock>,
     event_tx: UnboundedSender<ClientEvent>,
+    reason: ConnectionReason,
 ) {
     let mut backoff = MIN_BACKOFF;
     loop {
@@ -280,7 +312,15 @@ async fn supervise(
             Directive::Stop => return,
         };
 
-        match dial_client(&url, &server_id, &server_name, Arc::clone(&clock)).await {
+        match dial_client_with_reason(
+            &url,
+            &server_id,
+            &server_name,
+            Arc::clone(&clock),
+            reason.clone(),
+        )
+        .await
+        {
             Ok(conn) => {
                 // A Stop that arrived during the dial: don't announce a
                 // connection we're about to tear down.

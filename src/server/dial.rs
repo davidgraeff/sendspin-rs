@@ -30,6 +30,37 @@ pub async fn dial_client(
     dial_client_with_write_timeout(url, server_id, server_name, clock, DEFAULT_WRITE_TIMEOUT).await
 }
 
+/// [`dial_client`] with an explicit [`ConnectionReason`].
+///
+/// The spec lets several servers connect to one client and leaves the
+/// keep-or-switch policy to the *client*, which weighs each server's
+/// `connection_reason` (see `protocol::listener::ProtocolListener`). A server
+/// that dials merely to **be ready** — so an announcement or a control command
+/// can reach an otherwise-idle device without paying a cold connect — should say
+/// [`ConnectionReason::Discovery`] ("discovery/announcement"), not
+/// [`ConnectionReason::Playback`]: claiming Playback while streaming nothing (or
+/// nothing but silence) makes such a server look like the active one and can keep
+/// the device from switching to a server the user actually asked to play.
+/// [`dial_client`] keeps announcing Playback, which is right for a dial made in
+/// order to stream.
+pub async fn dial_client_with_reason(
+    url: &str,
+    server_id: &str,
+    server_name: &str,
+    clock: Arc<dyn Clock>,
+    reason: ConnectionReason,
+) -> Result<ServerConnection, Error> {
+    dial_client_inner(
+        url,
+        server_id,
+        server_name,
+        clock,
+        DEFAULT_WRITE_TIMEOUT,
+        reason,
+    )
+    .await
+}
+
 /// [`dial_client`] with an explicit per-write deadline instead of
 /// [`crate::server::DEFAULT_WRITE_TIMEOUT`] — see that constant for why writes
 /// are bounded at all.
@@ -40,17 +71,29 @@ pub async fn dial_client_with_write_timeout(
     clock: Arc<dyn Clock>,
     write_timeout: Duration,
 ) -> Result<ServerConnection, Error> {
+    // The server dialed out to stream to this client, so announce Playback.
+    // `dial_client_with_reason` covers the be-ready-only case.
+    dial_client_inner(
+        url,
+        server_id,
+        server_name,
+        clock,
+        write_timeout,
+        ConnectionReason::Playback,
+    )
+    .await
+}
+
+async fn dial_client_inner(
+    url: &str,
+    server_id: &str,
+    server_name: &str,
+    clock: Arc<dyn Clock>,
+    write_timeout: Duration,
+    reason: ConnectionReason,
+) -> Result<ServerConnection, Error> {
     let (ws, _response) = connect_async(url)
         .await
         .map_err(|e| Error::Connection(format!("dial to {url} failed: {e}")))?;
-    // The server dialed out to stream to this client, so announce Playback.
-    ServerConnection::drive(
-        ws,
-        server_id,
-        server_name,
-        ConnectionReason::Playback,
-        clock,
-        write_timeout,
-    )
-    .await
+    ServerConnection::drive(ws, server_id, server_name, reason, clock, write_timeout).await
 }
