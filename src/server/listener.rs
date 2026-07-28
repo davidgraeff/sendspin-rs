@@ -3,10 +3,11 @@
 
 use crate::error::Error;
 use crate::protocol::messages::ConnectionReason;
-use crate::server::connection::ServerConnection;
+use crate::server::connection::{ServerConnection, DEFAULT_WRITE_TIMEOUT};
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{lookup_host, TcpListener, TcpSocket, TcpStream, ToSocketAddrs};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -35,6 +36,7 @@ pub struct ServerListener {
     server_name: String,
     path: Option<String>,
     clock: Arc<dyn Clock>,
+    write_timeout: Duration,
 }
 
 impl std::fmt::Debug for ServerListener {
@@ -85,6 +87,7 @@ impl ServerListener {
             server_name: server_name.into(),
             path: None,
             clock: Arc::new(DefaultClock::default()),
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
         })
     }
 
@@ -106,6 +109,15 @@ impl ServerListener {
     /// need deterministic or synchronized-with-a-peer timestamps.
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Deadline for a single WebSocket write to a connected client before that
+    /// connection is declared dead. Defaults to
+    /// [`crate::server::DEFAULT_WRITE_TIMEOUT`]; see its docs for why the bound
+    /// matters. Lower it for tests that deliberately stall a socket.
+    pub fn write_timeout(mut self, write_timeout: Duration) -> Self {
+        self.write_timeout = write_timeout;
         self
     }
 
@@ -146,6 +158,7 @@ impl ServerListener {
             &self.server_name,
             ConnectionReason::Discovery,
             Arc::clone(&self.clock),
+            self.write_timeout,
         )
         .await
     }

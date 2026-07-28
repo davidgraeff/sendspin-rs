@@ -4,9 +4,10 @@
 
 use crate::error::Error;
 use crate::protocol::messages::ConnectionReason;
-use crate::server::connection::ServerConnection;
+use crate::server::connection::{ServerConnection, DEFAULT_WRITE_TIMEOUT};
 use crate::sync::raw_clock::Clock;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_tungstenite::connect_async;
 
 /// Dial a Sendspin client's own WebSocket server (e.g. a URL discovered via
@@ -26,6 +27,19 @@ pub async fn dial_client(
     server_name: &str,
     clock: Arc<dyn Clock>,
 ) -> Result<ServerConnection, Error> {
+    dial_client_with_write_timeout(url, server_id, server_name, clock, DEFAULT_WRITE_TIMEOUT).await
+}
+
+/// [`dial_client`] with an explicit per-write deadline instead of
+/// [`crate::server::DEFAULT_WRITE_TIMEOUT`] — see that constant for why writes
+/// are bounded at all.
+pub async fn dial_client_with_write_timeout(
+    url: &str,
+    server_id: &str,
+    server_name: &str,
+    clock: Arc<dyn Clock>,
+    write_timeout: Duration,
+) -> Result<ServerConnection, Error> {
     let (ws, _response) = connect_async(url)
         .await
         .map_err(|e| Error::Connection(format!("dial to {url} failed: {e}")))?;
@@ -36,6 +50,7 @@ pub async fn dial_client(
         server_name,
         ConnectionReason::Playback,
         clock,
+        write_timeout,
     )
     .await
 }
