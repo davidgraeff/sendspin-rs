@@ -10,8 +10,14 @@
 // lifecycle, player commands, close) and a data lane (audio). Control is
 // dequeued ahead of audio, so a member with a backlog of audio — or a socket
 // that has stopped draining entirely — can't delay a volume change or its own
-// disconnect. Every write is bounded by a timeout (`DEFAULT_WRITE_TIMEOUT`), so
-// a stalled socket becomes a dead connection rather than a stuck writer.
+// disconnect. Every write is bounded by a timeout (`DEFAULT_WRITE_TIMEOUT`), as is
+// the handshake that precedes the writer (`DEFAULT_HANDSHAKE_TIMEOUT`), so a
+// stalled socket becomes a dead connection rather than a stuck task.
+//
+// `server/time` echoes travel in a third, single-slot lane between the two: a
+// reply is derived only from the newest request, so a peer that floods
+// `client/time` can never have more than one outstanding and cannot turn its own
+// send rate into server memory or starve the audio lane.
 //
 // Because control overtakes audio, each control frame declares how it relates to
 // the audio it just overtook: a player command ignores it, `stream/start` and
@@ -39,11 +45,11 @@ mod timeline;
 pub use binary::encode_audio_frame;
 pub use connection::{
     AudioEnqueue, QueuedControl, ServerConnection, ServerConnectionGuard, ServerSender,
-    DEFAULT_WRITE_TIMEOUT,
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
 };
 pub use dial::{dial_client, dial_client_with_reason, dial_client_with_write_timeout};
 pub use discovery::{Advertisement, ClientBrowser, Discovered};
-pub use group::{Group, DEFAULT_SEND_AHEAD_US};
+pub use group::{Group, OwnsTimeline, SharesTimeline, DEFAULT_SEND_AHEAD_US};
 pub use listener::ServerListener;
 pub use manager::{ClientEvent, ClientManager};
 /// Re-export of the underlying mDNS daemon types so callers can build and

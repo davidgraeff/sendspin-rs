@@ -4,11 +4,13 @@
 
 use crate::error::Error;
 use crate::protocol::messages::ConnectionReason;
-use crate::server::connection::{ServerConnection, DEFAULT_WRITE_TIMEOUT};
+use crate::server::connection::{
+    ServerConnection, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
+};
 use crate::sync::raw_clock::Clock;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_with_config;
 
 /// Dial a Sendspin client's own WebSocket server (e.g. a URL discovered via
 /// [`crate::server::ClientBrowser`]) and drive the server-role handshake over
@@ -92,8 +94,21 @@ async fn dial_client_inner(
     write_timeout: Duration,
     reason: ConnectionReason,
 ) -> Result<ServerConnection, Error> {
-    let (ws, _response) = connect_async(url)
-        .await
-        .map_err(|e| Error::Connection(format!("dial to {url} failed: {e}")))?;
-    ServerConnection::drive(ws, server_id, server_name, reason, clock, write_timeout).await
+    let (ws, _response) = connect_async_with_config(
+        url,
+        Some(crate::server::listener::transport_config()),
+        false,
+    )
+    .await
+    .map_err(|e| Error::Connection(format!("dial to {url} failed: {e}")))?;
+    ServerConnection::drive(
+        ws,
+        server_id,
+        server_name,
+        reason,
+        clock,
+        write_timeout,
+        DEFAULT_HANDSHAKE_TIMEOUT,
+    )
+    .await
 }

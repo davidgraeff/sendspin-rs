@@ -3,7 +3,9 @@
 
 use crate::error::Error;
 use crate::protocol::messages::ConnectionReason;
-use crate::server::connection::{ServerConnection, DEFAULT_WRITE_TIMEOUT};
+use crate::server::connection::{
+    ServerConnection, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_WRITE_TIMEOUT,
+};
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,7 +14,24 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{lookup_host, TcpListener, TcpSocket, TcpStream, ToSocketAddrs};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http;
-use tokio_tungstenite::{accept_async, accept_hdr_async, WebSocketStream};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{accept_async_with_config, accept_hdr_async_with_config, WebSocketStream};
+
+/// WebSocket transport limits for a server-role connection.
+///
+/// `tungstenite`'s defaults are sized for a general-purpose WebSocket endpoint: a
+/// 128 KiB read buffer allocated up front and a 64 MiB maximum message size. A
+/// Sendspin peer only ever sends small JSON control frames — the protocol has no
+/// client-to-server binary frames at all, and this crate discards any it receives
+/// — so those defaults cost ~128 KiB of idle memory per connection and let a peer
+/// make the server accumulate up to 64 MiB of fragments for a message that is then
+/// thrown away.
+pub(crate) fn transport_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(8 * 1024)
+        .max_message_size(Some(64 * 1024))
+        .max_frame_size(Some(64 * 1024))
+}
 
 /// Accept inbound WebSocket peers and drive each one through the
 /// protocol-**server** state machine: read `client/hello`, reply
@@ -37,6 +56,7 @@ pub struct ServerListener {
     path: Option<String>,
     clock: Arc<dyn Clock>,
     write_timeout: Duration,
+    handshake_timeout: Duration,
 }
 
 impl std::fmt::Debug for ServerListener {
@@ -88,6 +108,7 @@ impl ServerListener {
             path: None,
             clock: Arc::new(DefaultClock::default()),
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         })
     }
 
@@ -121,16 +142,29 @@ impl ServerListener {
         self
     }
 
+    /// Deadline for an accepted peer to complete the handshake — `client/hello`
+    /// received and `server/hello` written. Defaults to
+    /// [`crate::server::DEFAULT_HANDSHAKE_TIMEOUT`].
+    ///
+    /// This is what stops one peer holding the accept loop: [`Self::accept`]
+    /// drives the handshake inline, so without a bound a peer that connects and
+    /// then stalls blocks every subsequent inbound connection.
+    pub fn handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+        self.handshake_timeout = handshake_timeout;
+        self
+    }
+
     /// Accept the next inbound connection, returning the driven
     /// [`ServerConnection`] and the peer's address.
     ///
     /// Per-peer failures surface as [`Error`] without affecting the
     /// listener; callers typically call `accept()` in a loop.
     ///
-    /// Not cancel-safe: dropping the returned future mid-handshake tears
-    /// down that connection. A peer that connects but stalls the handshake
-    /// will block this future indefinitely, so wrap it in a timeout if
-    /// untrusted peers can reach the socket.
+    /// Not cancel-safe: dropping the returned future mid-handshake tears down
+    /// that connection. A peer that connects and then stalls the handshake fails
+    /// after [`Self::handshake_timeout`] rather than blocking this future — which
+    /// matters because the handshake is driven inline, so an unbounded one would
+    /// hold up every subsequent inbound connection.
     pub async fn accept(&self) -> Result<(ServerConnection, SocketAddr), Error> {
         let (tcp_stream, peer_addr) = self
             .tcp
@@ -159,6 +193,7 @@ impl ServerListener {
             ConnectionReason::Discovery,
             Arc::clone(&self.clock),
             self.write_timeout,
+            self.handshake_timeout,
         )
         .await
     }
@@ -189,11 +224,11 @@ impl ServerListener {
                             as Result<Response, ErrorResponse>
                     }
                 };
-                accept_hdr_async(stream, callback)
+                accept_hdr_async_with_config(stream, callback, Some(transport_config()))
                     .await
                     .map_err(|e| Error::WebSocket(format!("WebSocket handshake failed: {e}")))
             }
-            None => accept_async(stream)
+            None => accept_async_with_config(stream, Some(transport_config()))
                 .await
                 .map_err(|e| Error::WebSocket(format!("WebSocket handshake failed: {e}"))),
         }

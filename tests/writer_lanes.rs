@@ -12,6 +12,9 @@ use sendspin::ServerListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Loop bound for "push until the backlog caps" probes.
+const MAX_BACKLOG_PROBE: usize = 200;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
@@ -438,4 +441,259 @@ async fn lifecycle_frames_stay_paired_while_another_thread_pushes() {
         lifecycle, expected,
         "lifecycle frames must stay strictly paired under cross-thread contention"
     );
+}
+
+/// A peer that floods `client/time` must not be able to convert its own send rate
+/// into server memory, nor starve the audio lane.
+///
+/// Control frames are written ahead of audio, so answering every request would let
+/// the peer keep the control lane permanently non-empty and the audio lane
+/// permanently unpolled. Replies are therefore coalesced into a single slot (only
+/// the newest request matters) and rate-limited, so a flood costs O(1) and audio
+/// keeps flowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_time_flood_neither_grows_nor_starves_the_audio_lane() {
+    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    // The peer floods client/time as fast as it can while reading replies.
+    let peer = tokio::spawn(async move {
+        let (ws, _) = connect_async(format!("ws://{addr}"))
+            .await
+            .expect("ws connect");
+        let (mut write, mut read) = ws.split();
+        let hello = serde_json::to_string(&Message::ClientHello(test_hello("flooder"))).unwrap();
+        write.send(WsMessage::Text(hello.into())).await.unwrap();
+        read.next().await.expect("no server/hello").unwrap();
+
+        let flood = tokio::spawn(async move {
+            let mut sent = 0u32;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+            while tokio::time::Instant::now() < deadline {
+                let msg = serde_json::to_string(&Message::ClientTime(
+                    sendspin::protocol::messages::ClientTime {
+                        client_transmitted: sent as i64,
+                    },
+                ))
+                .unwrap();
+                if write.send(WsMessage::Text(msg.into())).await.is_err() {
+                    break;
+                }
+                sent += 1;
+            }
+            sent
+        });
+
+        let mut audio = 0u32;
+        let mut replies = 0u32;
+        while let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(900), read.next()).await {
+            match msg {
+                WsMessage::Binary(_) => audio += 1,
+                WsMessage::Text(_) => replies += 1,
+                _ => {}
+            }
+        }
+        (flood.await.unwrap(), audio, replies)
+    });
+
+    let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let group = Group::new(Arc::new(sendspin::DefaultClock::default()));
+    group
+        .add_member(conn.client_id().to_string(), conn.sender())
+        .await
+        .unwrap();
+    group.start_stream(pcm_config()).await;
+
+    // Push audio for as long as the flood runs.
+    for _ in 0..30 {
+        group.push_audio(&[0x22; 256]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(conn);
+
+    let (sent, audio, replies) = peer.await.unwrap();
+    assert!(
+        sent > 100,
+        "the flood needs to be a flood; only sent {sent}"
+    );
+    assert!(
+        audio > 0,
+        "audio was starved to zero by {sent} client/time requests"
+    );
+    assert!(
+        replies < sent / 2,
+        "{replies} replies for {sent} requests — they are not being coalesced"
+    );
+}
+
+/// A connection whose writer has died must be reported as dead even when the audio
+/// backlog happens to be full.
+///
+/// The backlog counter is only decremented by the writer, so frames still queued
+/// when it exits are never accounted for — leaving the counter pegged at the cap on
+/// a connection that is already gone. If the cap were checked before liveness, the
+/// caller would be told `Evicted` forever and would never prune the member: no
+/// audio, no `Disconnected`, no re-dial, nothing logged above `trace`.
+#[tokio::test]
+async fn a_dead_writer_is_reported_even_with_a_full_backlog() {
+    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let peer = tokio::spawn({
+        let url = format!("ws://{addr}");
+        async move { connect_peer(&url, "member").await }
+    });
+    let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let _read = peer.await.unwrap();
+    let sender = conn.sender();
+
+    // Fill the lane with no await in between, so the writer has not run: the cap is
+    // reached with every frame still queued.
+    let mut capped = false;
+    for _ in 0..MAX_BACKLOG_PROBE {
+        let frame = sendspin::server::encode_audio_frame(1, &[0u8; 64]);
+        match sender.enqueue_audio(frame.into()).expect("enqueue") {
+            AudioEnqueue::Sent => {}
+            AudioEnqueue::Evicted => {
+                capped = true;
+                break;
+            }
+        }
+    }
+    assert!(capped, "expected the backlog to reach its cap");
+
+    // Kill the writer through the close path, which drops the queued frames
+    // without decrementing them.
+    let _ = timeout(Duration::from_secs(5), conn.disconnect()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let frame = sendspin::server::encode_audio_frame(2, &[0u8; 8]);
+    assert!(
+        sender.enqueue_audio(frame.into()).is_err(),
+        "a full backlog hid a dead writer — the member would never be pruned"
+    );
+}
+
+/// A peer that completes the WebSocket handshake and then says nothing must not
+/// park the task driving it, and must not hold up the next peer.
+///
+/// `accept` drives the handshake inline, so an unbounded `client/hello` read blocks
+/// every subsequent inbound connection; on the dial side the same read parks a
+/// supervisor with no backoff progression.
+#[tokio::test]
+async fn a_silent_peer_fails_its_handshake_without_blocking_the_next_one() {
+    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+        .await
+        .expect("bind")
+        .handshake_timeout(Duration::from_millis(300));
+    let addr = listener.local_addr().expect("local_addr");
+
+    // Connects, never sends client/hello, and stays connected.
+    let silent = tokio::spawn(async move {
+        let (ws, _) = connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        drop(ws);
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let started = Instant::now();
+    let first = timeout(Duration::from_secs(3), listener.accept()).await;
+    assert!(
+        first.is_ok(),
+        "accept() never returned for a silent peer — the accept loop is wedged"
+    );
+    assert!(
+        first.unwrap().is_err(),
+        "a silent peer must fail its handshake"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "handshake bound not honoured: took {:?}",
+        started.elapsed()
+    );
+
+    // The listener is still usable: a well-behaved peer connects right after.
+    let good = tokio::spawn({
+        let url = format!("ws://{addr}");
+        async move { connect_peer(&url, "good-member").await }
+    });
+    let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("second accept timed out")
+        .expect("second accept failed");
+    assert_eq!(conn.client_id(), "good-member");
+    drop(good);
+    silent.abort();
+}
+
+/// `stream/end` flushes the audio pushed before it, but that flush shares one
+/// write-timeout budget with the frame itself.
+///
+/// Giving each flushed frame its own deadline would make the bound backlog ×
+/// write_timeout — with the defaults, minutes — for a member that is merely slow
+/// rather than dead, because every individual write succeeds. Past the budget the
+/// remaining tail is dropped instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_end_stays_bounded_against_a_slow_peer() {
+    let write_timeout = Duration::from_millis(300);
+    let listener = ServerListener::bind("127.0.0.1:0", "test-server", "Test Server")
+        .await
+        .expect("bind")
+        .write_timeout(write_timeout);
+    let addr = listener.local_addr().expect("local_addr");
+
+    // Drains one message per 120ms: never stalls a single write, but far too slow
+    // to clear a full backlog inside one timeout.
+    let peer = tokio::spawn(async move {
+        let (ws, _) = connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let (mut write, mut read) = ws.split();
+        let hello = serde_json::to_string(&Message::ClientHello(test_hello("slow"))).unwrap();
+        write.send(WsMessage::Text(hello.into())).await.unwrap();
+        read.next().await.unwrap().unwrap();
+        loop {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            if timeout(Duration::from_secs(2), read.next()).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let sender = conn.sender();
+
+    let big = vec![0x5Au8; 256 * 1024];
+    for _ in 0..MAX_BACKLOG_PROBE {
+        let frame = sendspin::server::encode_audio_frame(1, &big);
+        if matches!(
+            sender.enqueue_audio(frame.into()),
+            Ok(AudioEnqueue::Evicted) | Err(_)
+        ) {
+            break;
+        }
+    }
+
+    let started = Instant::now();
+    let _ = timeout(Duration::from_secs(20), sender.send_stream_end()).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < 4 * write_timeout,
+        "stream/end took {elapsed:?}; the flush is paying per-frame deadlines rather \
+         than one shared budget"
+    );
+    peer.abort();
 }

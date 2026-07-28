@@ -15,8 +15,10 @@ use futures_util::{
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio_tungstenite::{
     tungstenite::{Bytes, Message as WsMessage},
     WebSocketStream,
@@ -32,6 +34,24 @@ const PLAYER_ROLE: &str = "player@v1";
 /// bounds memory for a slow or stalled member so it can't back up the whole
 /// process — its own audio suffers, nobody else's does.
 const MAX_QUEUED_AUDIO_FRAMES: usize = 32;
+
+/// Minimum spacing between `server/time` replies. The spec's cadence is about
+/// one `client/time` per second; a peer that asks far faster gains nothing (each
+/// reply supersedes the last) and would otherwise convert its own send rate into
+/// server work. Requests arriving inside this window are answered by the reply
+/// already pending rather than queueing another.
+const MIN_TIME_REPLY_INTERVAL_US: i64 = 50_000;
+
+/// Default deadline for the inbound handshake — `client/hello` must arrive, and
+/// `server/hello` must be written, within this.
+///
+/// A peer that completes the WebSocket handshake and then goes silent (or stops
+/// reading) would otherwise park the task driving it forever. That matters more
+/// than it sounds: [`crate::server::ServerListener::accept`] drives the handshake
+/// inline, so one such peer blocks every subsequent inbound connection, and on the
+/// dial side it parks a [`crate::server::ClientManager`] supervisor with no
+/// backoff progression and no way to redirect it.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default deadline for a single WebSocket write before the connection is
 /// declared dead (override with [`crate::server::ServerListener::write_timeout`]).
@@ -80,9 +100,10 @@ enum AudioOrdering {
     Supersede(u64),
     /// Write the audio queued before it *first*, then the frame itself.
     /// `stream/end` logically follows everything already pushed, so overtaking
-    /// it would truncate the tail of the stream. The flush is still bounded: the
-    /// first write that stalls past the write timeout fails the whole thing, so
-    /// a dead member can't hold `stream/end` for backlog × timeout.
+    /// it would truncate the tail of the stream. The flush shares a single
+    /// write-timeout budget with the frame it precedes — per-frame deadlines
+    /// would let a merely-slow member hold `stream/end` for backlog × timeout —
+    /// so once that budget is spent the remaining tail is dropped.
     Flush(u64),
 }
 
@@ -99,19 +120,27 @@ enum ControlCommand {
         ordering: AudioOrdering,
         ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
     },
-    /// `server/time` reply: `server_transmitted` is stamped from the clock
-    /// immediately before the frame reaches the wire, not when this command
-    /// was enqueued — queueing delay would otherwise leak into the client's
-    /// clock filter as measurement error (this is why it's its own variant
-    /// rather than a pre-built `Send`).
-    TimeReply {
-        client_transmitted: i64,
-        server_received: i64,
-        ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
-    },
     Close {
         ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
     },
+}
+
+/// A pending `server/time` echo.
+///
+/// This travels in a single-slot [`watch`] channel rather than a queue, and that
+/// is a correctness property, not an optimisation: the reply is derived purely
+/// from the *latest* request, so a peer that floods `client/time` can only ever
+/// have one outstanding. Queueing one per request instead lets a peer's send rate
+/// dictate the server's memory use and, because control frames are written ahead
+/// of audio, starve the audio lane to a standstill.
+///
+/// `server_transmitted` is stamped by the writer immediately before the frame
+/// reaches the wire, not here — waiting time would otherwise leak into the
+/// client's clock filter as measurement error.
+#[derive(Debug, Clone, Copy)]
+struct TimeRequest {
+    client_transmitted: i64,
+    server_received: i64,
 }
 
 /// One data-plane (audio) frame for the writer task.
@@ -159,6 +188,12 @@ where
 /// without serializing against the control frame gets best-effort ordering — see
 /// [`QueuedControl`] for how [`crate::server::Group`] serializes the two.)
 ///
+/// Bounded by `deadline` **overall**, not per frame. Per-frame deadlines would
+/// make the flush cost backlog × write_timeout — a member slow enough to keep
+/// succeeding could hold `stream/end` (and the close behind it) for minutes. Past
+/// the deadline the remaining tail is dropped, which is the right trade: the tail
+/// of an ending stream is worth less than the connection.
+///
 /// Returns the first write error, leaving the rest un-flushed: the connection is
 /// finished at that point, so there's nothing to salvage.
 async fn flush_audio_before<S>(
@@ -167,7 +202,7 @@ async fn flush_audio_before<S>(
     audio_queued: &AtomicUsize,
     before: u64,
     drop_audio_before: u64,
-    write_timeout: Duration,
+    deadline: Instant,
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -179,11 +214,13 @@ where
         // it and stop. That also bounds the flush against a task that keeps
         // pushing audio concurrently.
         let reached_marker = audio.seq >= before;
-        let result = if audio.seq < drop_audio_before {
-            // Superseded by an earlier transition that already went out.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = if audio.seq < drop_audio_before || remaining.is_zero() {
+            // Superseded by an earlier transition that already went out, or the
+            // flush budget is spent and the tail is being dropped.
             Ok(())
         } else {
-            write_frame(sink, WsMessage::Binary(audio.frame), write_timeout).await
+            write_frame(sink, WsMessage::Binary(audio.frame), remaining).await
         };
         audio_queued.fetch_sub(1, Ordering::Relaxed);
         match result {
@@ -193,7 +230,12 @@ where
                 }
             }
             Err(e) => {
-                let propagated = Error::WebSocket(e.to_string());
+                // Report the flush failure as its own thing: the caller is awaiting
+                // a lifecycle frame and would otherwise be told its own write
+                // stalled, with the error text wrapped twice.
+                let propagated = Error::WebSocket(format!(
+                    "audio flush before a stream transition failed: {e}"
+                ));
                 if let Some(ack) = audio.ack {
                     let _ = ack.send(Err(e));
                 }
@@ -210,6 +252,7 @@ where
 async fn writer_task<S>(
     mut sink: SplitSink<WebSocketStream<S>, WsMessage>,
     mut ctrl_rx: UnboundedReceiver<ControlCommand>,
+    mut time_rx: watch::Receiver<Option<TimeRequest>>,
     mut audio_rx: UnboundedReceiver<AudioCommand>,
     clock: Arc<dyn Clock>,
     audio_queued: Arc<AtomicUsize>,
@@ -225,7 +268,9 @@ async fn writer_task<S>(
     loop {
         // `biased` makes this a strict priority rather than a random choice:
         // whenever a control frame is queued it is taken first, so queued audio
-        // can never delay one.
+        // can never delay one. The time lane sits between the two: it is
+        // single-slot, so it can hold at most one frame's worth of priority over
+        // audio no matter how fast a peer asks.
         tokio::select! {
             biased;
             Some(cmd) = ctrl_rx.recv() => {
@@ -240,13 +285,17 @@ async fn writer_task<S>(
                                 write_frame(&mut sink, msg, write_timeout).await
                             }
                             AudioOrdering::Flush(seq) => {
+                                // One budget covers the flushed tail *and* the frame
+                                // itself, so the whole operation stays inside two
+                                // write timeouts however deep the backlog is.
+                                let deadline = Instant::now() + write_timeout;
                                 match flush_audio_before(
                                     &mut sink,
                                     &mut audio_rx,
                                     &audio_queued,
                                     seq,
                                     drop_audio_before,
-                                    write_timeout,
+                                    deadline,
                                 )
                                 .await
                                 {
@@ -256,25 +305,8 @@ async fn writer_task<S>(
                             }
                         };
                         let failed = result.is_err();
+                        log::debug!("Wrote control frame: ok={}", !failed);
                         // Ignore SendError: the caller may have dropped its receiver.
-                        let _ = ack.send(result);
-                        if failed {
-                            break;
-                        }
-                    }
-                    ControlCommand::TimeReply { client_transmitted, server_received, ack } => {
-                        let reply = Message::ServerTime(ServerTime {
-                            client_transmitted,
-                            server_received,
-                            server_transmitted: clock.now_micros(),
-                        });
-                        let result = match serde_json::to_string(&reply) {
-                            Ok(json) => {
-                                write_frame(&mut sink, WsMessage::Text(json.into()), write_timeout).await
-                            }
-                            Err(e) => Err(Error::Protocol(e.to_string())),
-                        };
-                        let failed = result.is_err();
                         let _ = ack.send(result);
                         if failed {
                             break;
@@ -292,6 +324,28 @@ async fn writer_task<S>(
                         let _ = ack.send(result);
                         break;
                     }
+                }
+            }
+            Ok(()) = time_rx.changed() => {
+                // Stamp `server_transmitted` here, immediately before the write, so
+                // however long this reply waited behind other frames does not leak
+                // into the client's clock filter as measurement error.
+                let Some(req) = *time_rx.borrow_and_update() else {
+                    continue;
+                };
+                let reply = Message::ServerTime(ServerTime {
+                    client_transmitted: req.client_transmitted,
+                    server_received: req.server_received,
+                    server_transmitted: clock.now_micros(),
+                });
+                let result = match serde_json::to_string(&reply) {
+                    Ok(json) => {
+                        write_frame(&mut sink, WsMessage::Text(json.into()), write_timeout).await
+                    }
+                    Err(e) => Err(Error::Protocol(e.to_string())),
+                };
+                if result.is_err() {
+                    break;
                 }
             }
             Some(audio) = audio_rx.recv() => {
@@ -334,9 +388,11 @@ pub struct QueuedControl {
 impl QueuedControl {
     /// Wait for this frame to reach the socket.
     ///
-    /// Bounded by the connection's write timeout (see
-    /// [`DEFAULT_WRITE_TIMEOUT`]) plus whatever control frames were already
-    /// queued ahead of it — never by queued audio.
+    /// Bounded by the connection's write timeout (see [`DEFAULT_WRITE_TIMEOUT`])
+    /// plus whatever control frames were already queued ahead of it. A
+    /// `stream/end` additionally waits for the audio pushed before it, but that
+    /// flush shares one write-timeout budget with the frame itself, so the total
+    /// stays within two write timeouts regardless of backlog depth.
     pub async fn written(self) -> Result<(), Error> {
         match self.result {
             Ok(ack) => ack
@@ -368,6 +424,15 @@ impl ServerSender {
     /// growing memory without bound. `Err` means the writer task is gone (the
     /// member is dead) and the caller should stop broadcasting to it.
     pub fn enqueue_audio(&self, frame: Bytes) -> Result<AudioEnqueue, Error> {
+        // Liveness is checked before the backlog, and must stay that way. The
+        // counter is only decremented by the writer, so frames still queued when
+        // the writer exits are never accounted for — leaving the counter at or
+        // above the cap on a connection that is already dead. Checking the backlog
+        // first would then report `Evicted` forever and the caller would never
+        // learn to prune the member.
+        if self.audio_tx.is_closed() {
+            return Err(Error::WebSocket("connection closed".to_string()));
+        }
         if self.audio_queued.load(Ordering::Relaxed) >= MAX_QUEUED_AUDIO_FRAMES {
             return Ok(AudioEnqueue::Evicted);
         }
@@ -386,10 +451,15 @@ impl ServerSender {
         }
     }
 
-    /// Claim the next audio sequence number. `AcqRel`/`Acquire` (rather than
-    /// `Relaxed`) so the ordering between claiming a sequence number here and
-    /// reading the counter in [`Self::queue_control`] holds on its own, without
-    /// depending on the caller's lock to provide it.
+    /// Claim the next audio sequence number.
+    ///
+    /// Note what this does *not* buy: no memory ordering on this counter can order
+    /// the claim against the separate `audio_tx.send` that follows it, so a frame
+    /// can be numbered before a control frame computes its marker and still reach
+    /// the channel after. What makes the marker exact is the caller holding one
+    /// lock across claim *and* send — which is precisely what
+    /// [`crate::server::Group`] does. Concurrent pushers on one `ServerSender`
+    /// without that lock get best-effort ordering.
     fn next_audio_seq(&self) -> u64 {
         self.audio_seq.fetch_add(1, Ordering::AcqRel)
     }
@@ -410,7 +480,10 @@ impl ServerSender {
                 }
             }
         };
-        log::debug!("Queueing message: {}", json);
+        // Deliberately no logging here: `Group` calls this while holding the lock
+        // that orders frames, and formatting a log record — let alone a subscriber
+        // blocking on a full pipe — would extend that critical section without
+        // bound. The writer logs what actually went out instead.
         let ordering = mark(self.audio_seq.load(Ordering::Acquire));
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let cmd = ControlCommand::Send {
@@ -540,9 +613,14 @@ impl ServerConnectionGuard {
     /// (optionally after the caller has already sent `stream/end`).
     ///
     /// The close command travels the control lane, so it is never queued behind
-    /// this connection's pending audio. It can still wait on one in-flight
-    /// write plus its own, both bounded by the connection's write timeout — so
+    /// this connection's pending audio. It can still wait on one in-flight write
+    /// plus its own — and, if a `stream/end` is queued ahead of it, on that
+    /// frame's flush budget — each bounded by the connection's write timeout, so
     /// this returns even against a socket that has stopped draining entirely.
+    ///
+    /// Audio still queued when the close is processed is **discarded**: nothing
+    /// behind a close is written. Call [`ServerSender::send_stream_end`] first if
+    /// the tail of the stream matters.
     pub async fn disconnect(mut self) -> Result<(), Error> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let close_result = self
@@ -639,12 +717,90 @@ impl ServerConnection {
         connection_reason: ConnectionReason,
         clock: Arc<dyn Clock>,
         write_timeout: Duration,
+        handshake_timeout: Duration,
     ) -> Result<Self, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut write, mut read) = ws_stream.split();
 
+        // Everything up to the writer task's existence is bounded here, because
+        // until it exists there is nothing else to bound it: a peer that finishes
+        // the WebSocket handshake and then stays silent, or stops reading, would
+        // otherwise park this task forever — and with it the accept loop or the
+        // dial supervisor that is driving it.
+        let handshake = tokio::time::timeout(
+            handshake_timeout,
+            Self::handshake(
+                &mut write,
+                &mut read,
+                server_id,
+                server_name,
+                connection_reason,
+                write_timeout,
+            ),
+        );
+        let (hello, active_roles) = match handshake.await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(Error::Connection(format!(
+                    "handshake did not complete within {handshake_timeout:?}"
+                )))
+            }
+        };
+
+        let (ctrl_tx, ctrl_rx) = unbounded_channel::<ControlCommand>();
+        let (audio_tx, audio_rx) = unbounded_channel::<AudioCommand>();
+        let (time_tx, time_rx) = watch::channel::<Option<TimeRequest>>(None);
+        let (message_tx, message_rx) = unbounded_channel();
+
+        let audio_queued = Arc::new(AtomicUsize::new(0));
+        let writer_handle = tokio::spawn(writer_task(
+            write,
+            ctrl_rx,
+            time_rx,
+            audio_rx,
+            Arc::clone(&clock),
+            Arc::clone(&audio_queued),
+            write_timeout,
+        ));
+
+        let router_handle = tokio::spawn(async move {
+            Self::message_router(read, message_tx, time_tx, clock).await;
+        });
+
+        let sender = ServerSender {
+            ctrl_tx,
+            audio_tx,
+            audio_queued,
+            audio_seq: Arc::new(AtomicU64::new(0)),
+        };
+        Ok(Self {
+            hello,
+            active_roles: active_roles.clone(),
+            messages: message_rx,
+            sender: sender.clone(),
+            guard: ServerConnectionGuard {
+                sender,
+                router_handle: Some(router_handle),
+                writer_handle: Some(writer_handle),
+            },
+        })
+    }
+
+    /// Read `client/hello`, negotiate roles, reply `server/hello`. Split out of
+    /// [`Self::drive`] so the whole exchange can sit inside one deadline.
+    async fn handshake<S>(
+        write: &mut SplitSink<WebSocketStream<S>, WsMessage>,
+        read: &mut SplitStream<WebSocketStream<S>>,
+        server_id: &str,
+        server_name: &str,
+        connection_reason: ConnectionReason,
+        write_timeout: Duration,
+    ) -> Result<(ClientHello, Vec<String>), Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         log::debug!("Waiting for client/hello...");
         let hello = loop {
             let Some(result) = read.next().await else {
@@ -701,58 +857,23 @@ impl ServerConnection {
         });
         let json =
             serde_json::to_string(&server_hello).map_err(|e| Error::Protocol(e.to_string()))?;
-        write
-            .send(WsMessage::Text(json.into()))
-            .await
-            .map_err(|e| Error::WebSocket(e.to_string()))?;
+        // Bounded like every other write: this one runs before the writer task
+        // exists, so it needs its own deadline rather than inheriting one.
+        write_frame(write, WsMessage::Text(json.into()), write_timeout).await?;
 
-        let (ctrl_tx, ctrl_rx) = unbounded_channel::<ControlCommand>();
-        let (audio_tx, audio_rx) = unbounded_channel::<AudioCommand>();
-        let (message_tx, message_rx) = unbounded_channel();
-
-        let audio_queued = Arc::new(AtomicUsize::new(0));
-        let writer_handle = tokio::spawn(writer_task(
-            write,
-            ctrl_rx,
-            audio_rx,
-            Arc::clone(&clock),
-            Arc::clone(&audio_queued),
-            write_timeout,
-        ));
-
-        let ctrl_tx_router = ctrl_tx.clone();
-        let router_handle = tokio::spawn(async move {
-            Self::message_router(read, message_tx, ctrl_tx_router, clock).await;
-        });
-
-        let sender = ServerSender {
-            ctrl_tx,
-            audio_tx,
-            audio_queued,
-            audio_seq: Arc::new(AtomicU64::new(0)),
-        };
-        Ok(Self {
-            hello,
-            active_roles,
-            messages: message_rx,
-            sender: sender.clone(),
-            guard: ServerConnectionGuard {
-                sender,
-                router_handle: Some(router_handle),
-                writer_handle: Some(writer_handle),
-            },
-        })
+        Ok((hello, active_roles))
     }
 
     async fn message_router<S>(
         mut read: SplitStream<WebSocketStream<S>>,
         message_tx: UnboundedSender<Message>,
-        ctrl_tx: UnboundedSender<ControlCommand>,
+        time_tx: watch::Sender<Option<TimeRequest>>,
         clock: Arc<dyn Clock>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut message_closed = false;
+        let mut last_time_reply_us: Option<i64> = None;
 
         while let Some(msg) = read.next().await {
             match msg {
@@ -762,13 +883,23 @@ impl ServerConnection {
                     let server_received = clock.now_micros();
                     match serde_json::from_str::<Message>(&text) {
                         Ok(Message::ClientTime(t)) => {
-                            let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
-                            if ctrl_tx
-                                .send(ControlCommand::TimeReply {
+                            // Rate-limit, then coalesce. A peer asking faster than
+                            // the spec's ~1/s cadence gains nothing — each reply
+                            // supersedes the last — but answering every request
+                            // would let its send rate drive our work and memory.
+                            let too_soon = last_time_reply_us.is_some_and(|last| {
+                                server_received - last < MIN_TIME_REPLY_INTERVAL_US
+                            });
+                            if too_soon {
+                                log::trace!("Ignoring client/time inside the reply interval");
+                                continue;
+                            }
+                            last_time_reply_us = Some(server_received);
+                            if time_tx
+                                .send(Some(TimeRequest {
                                     client_transmitted: t.client_transmitted,
                                     server_received,
-                                    ack: ack_tx,
-                                })
+                                }))
                                 .is_err()
                             {
                                 break;
