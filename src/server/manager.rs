@@ -6,6 +6,7 @@ use crate::server::connection::{ServerConnection, ServerSender};
 use crate::server::dial::dial_client;
 use crate::server::discovery::{ClientBrowser, Discovered};
 use crate::sync::raw_clock::Clock;
+use mdns_sd::ServiceDaemon;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -118,13 +119,32 @@ impl ClientManager {
         clock: Arc<dyn Clock>,
         allow: impl Fn(&str) -> bool + Send + 'static,
     ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
+        Self::start_filtered_with_daemon(server_id, server_name, clock, allow, None)
+    }
+
+    /// Like [`Self::start_filtered`], but browses on a **caller-provided** mDNS
+    /// daemon (see [`ClientBrowser::with_daemon`]) instead of spawning its own —
+    /// so an embedder can share one interface-restricted daemon across all of
+    /// its mDNS instead of adding a `mDNS_daemon` thread (and, under
+    /// host-networking, its multicast amplification) per manager. Passing `None`
+    /// is exactly [`Self::start_filtered`].
+    pub fn start_filtered_with_daemon(
+        server_id: impl Into<String>,
+        server_name: impl Into<String>,
+        clock: Arc<dyn Clock>,
+        allow: impl Fn(&str) -> bool + Send + 'static,
+        daemon: Option<ServiceDaemon>,
+    ) -> Result<(Self, UnboundedReceiver<ClientEvent>), crate::error::Error> {
         let server_id = server_id.into();
         let server_name = server_name.into();
         let (event_tx, event_rx) = unbounded_channel();
         let tasks: Arc<Mutex<HashMap<String, ManagedClient>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let browser = ClientBrowser::new()?;
+        let browser = match daemon {
+            Some(d) => ClientBrowser::with_daemon(d)?,
+            None => ClientBrowser::new()?,
+        };
         let tasks_for_browse = Arc::clone(&tasks);
         let browse_handle = tokio::spawn(async move {
             while let Some(event) = browser.next_event().await {
