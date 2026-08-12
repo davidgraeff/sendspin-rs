@@ -324,9 +324,27 @@ pub enum PlayerStateCommand {
 pub enum ClientSyncState {
     /// Client's clock filter has converged enough to begin scheduling playback.
     Synchronized,
+    /// Client hit a playback error. `sendspin-cpp` ≥ 0.7.0 reports this on an
+    /// **unexpected loss of sync** — a hard sync outside of startup/seek alignment, i.e.
+    /// typically a buffer underrun (`sync_task.cpp`: "report ERROR once and keep filling
+    /// with silence until we re-align"). Sent once per episode; `Synchronized` follows
+    /// when the client is back in step.
+    ///
+    /// For a server this is the *only* signal a player gives that it is not rendering
+    /// what it was sent, so it is worth surfacing rather than merely accepting.
+    Error,
     /// Client is in use by an external system (e.g., different audio source, HDMI input)
     /// and is not currently participating in Sendspin playback with this server.
     ExternalSource,
+    /// A value this version does not know (forward compatibility).
+    ///
+    /// Load-bearing, not decoration: without it an unrecognised `state` fails to
+    /// deserialize and takes the **entire `client/state` message** with it — including
+    /// the volume, mute and static-delay the same message carries. That is how a player
+    /// reporting a state we had not implemented silently stopped its own UI from
+    /// updating. Mirrors [`PlayerCommandType::Unknown`].
+    #[serde(other)]
+    Unknown,
 }
 
 /// Server state update message (metadata and controller info)

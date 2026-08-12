@@ -114,6 +114,44 @@ fn test_client_sync_state_external_source() {
     assert!(json.contains("\"state\":\"external_source\""));
 }
 
+/// `sendspin-cpp` ≥ 0.7.0 sends this on an unexpected loss of sync (buffer underrun) —
+/// the only signal a player gives that it is not rendering what it was sent. It must
+/// parse, and the rest of the message must survive with it: the same `client/state`
+/// carries the volume, mute and static delay a server needs.
+#[test]
+fn test_client_sync_state_error_parses_with_the_rest_of_the_message() {
+    let json = r#"{"type":"client/state","payload":{"state":"error","player":{"volume":42,"muted":false,"static_delay_ms":60}}}"#;
+    let message: Message = serde_json::from_str(json).expect("an error state must not sink the message");
+    let Message::ClientState(state) = message else {
+        panic!("expected client/state");
+    };
+    assert_eq!(state.state, Some(ClientSyncState::Error));
+    let player = state.player.expect("the player object still arrives");
+    assert_eq!(player.volume, Some(42));
+    assert_eq!(player.static_delay_ms, Some(60));
+
+    // Round-trips back to the wire value the spec (and sendspin-cpp's `to_cstr`) uses.
+    let out = serde_json::to_string(&Message::ClientState(ClientState { state: Some(ClientSyncState::Error), player: None })).unwrap();
+    assert!(out.contains("\"state\":\"error\""), "got {out}");
+}
+
+/// Forward compatibility, and the reason `Unknown` exists at all: a state this version
+/// has never heard of must degrade to "unknown", not discard the volume/mute/delay the
+/// message came to deliver. Without the `#[serde(other)]` fallback the whole
+/// `client/state` fails to deserialize and a player's UI silently stops updating.
+#[test]
+fn test_an_unknown_client_state_keeps_the_rest_of_the_message() {
+    let json = r#"{"type":"client/state","payload":{"state":"buffering","player":{"volume":7,"muted":true}}}"#;
+    let message: Message = serde_json::from_str(json).expect("an unknown state must not sink the message");
+    let Message::ClientState(state) = message else {
+        panic!("expected client/state");
+    };
+    assert_eq!(state.state, Some(ClientSyncState::Unknown));
+    let player = state.player.expect("the player object still arrives");
+    assert_eq!(player.volume, Some(7));
+    assert_eq!(player.muted, Some(true));
+}
+
 #[test]
 #[allow(deprecated)]
 fn test_server_state_metadata_deserialization() {
